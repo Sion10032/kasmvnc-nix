@@ -99,7 +99,7 @@ KasmVNC 必须有至少一条用户记录才能启动，因此 `passwordFile = n
 ### `windowManager`
 
 `windowManager` 是写进 `~/.vnc/xstartup` 的会话命令，由 `kasmvnc.service`（系统服务）
-中的 X 会话执行。两点需要注意：
+中的 X 会话执行。三点需要注意：
 
 1. **裸命令名按服务的 `PATH` 解析。** 给 systemd 单元设置 `path` 会**整体替换**该单元
    的 `PATH`，而不是追加，因此模块显式在末尾加了系统 profile
@@ -111,6 +111,17 @@ KasmVNC 必须有至少一条用户记录才能启动，因此 `passwordFile = n
 2. **桌面环境需要 D-Bus 会话总线。** `xfce4-session` 等在没有会话总线时会拒绝启动
    （xstartup 会 `unset DBUS_SESSION_BUS_ADDRESS`，沿用上游镜像的做法），因此要用
    `dbus-run-session` 包裹；`dbus` 已在服务 `PATH` 中，可以裸名调用。
+3. **桌面环境所需的 XDG 会话环境由模块注入。** 系统服务拿不到登录会话的环境
+   （`/etc/set-environment`），而桌面环境依赖它：`XDG_DATA_DIRS` 决定会话总线的
+   D-Bus activation 能否找到 `share/dbus-1/services/*.service`（例如
+   `org.xfce.Xfconf.service` → `xfconfd`），`XDG_CONFIG_DIRS` 决定默认配置从哪里读
+   （例如 `etc/xdg/xfce4/xfconf/xfce-perchannel-xml/`，`xfce4-session` 靠它得到
+   failsafe 会话定义）。模块为这两个变量提供默认值，**继承自系统的 session 变量**
+   （`environment.sessionVariables` 加上 `environment.profileRelativeSessionVariables`
+   对 `environment.profiles` 的展开，与登录会话的算法一致）；系统自定义过 session
+   环境时服务会一并跟上。需要覆盖时用
+   `systemd.services.kasmvnc.environment.XDG_DATA_DIRS` /
+   `.XDG_CONFIG_DIRS`（模块用的是 `mkDefault`）。
 
 ```nix
 # 1) 裸名 + D-Bus 会话总线（程序需系统级安装，如 services.xserver.desktopManager.xfce）

@@ -170,4 +170,75 @@ in
       machine.succeed("pgrep -af '[k]asmvnc-test-wm' | grep -q /run/current-system/sw/bin")
     '';
   };
+
+  # Regression test for the XDG session environment. The service starts a
+  # desktop *session* but gets none of the login session's environment, so
+  # `XDG_DATA_DIRS` (D-Bus activation of `org.xfce.Xfconf.service` -> xfconfd)
+  # and `XDG_CONFIG_DIRS` (default xfconf channels) have to be injected by the
+  # module. Without them xfce4-session finds neither xfconfd's activation file
+  # nor its failsafe session definition: it comes up with no clients at all, and
+  # on some versions aborts with "unable to determine failsafe session name.
+  # xfconfd isn't running. $XDG_CONFIG_DIRS is set incorrectly". A fake window
+  # manager cannot observe any of this, hence a real desktop environment.
+  # No `services.xserver`: no display manager, everything comes from the
+  # system profile plus what the module injects.
+  kasmvnc-xfce = pkgs.testers.runNixOSTest {
+    name = "kasmvnc-xfce";
+
+    nodes.machine =
+      { pkgs, ... }:
+      {
+        imports = [
+          kasmvncModule
+          common
+        ];
+
+        environment.systemPackages = with pkgs; [
+          # xfce4-session itself plus the clients of its failsafe session
+          # (`xfwm4`, `xfsettingsd`, `xfce4-panel`, ...), installed through the
+          # system profile only.
+          xfce4-session
+          xfconf
+          xfwm4
+          xfdesktop
+          xfce4-panel
+          xfce4-settings
+        ];
+
+        services.kasmvnc = {
+          enable = true;
+          windowManager = "dbus-run-session xfce4-session";
+        };
+      };
+
+    testScript = ''
+      start_all()
+
+      machine.wait_for_unit("kasmvnc.service", timeout=300)
+
+      # The session manager has to stay alive. The brackets in the patterns keep
+      # the test driver's own `bash -c ...` wrapper from matching itself.
+      machine.wait_until_succeeds("pgrep -f '[x]fce4-session'", timeout=60)
+      # ...and xfconfd has to have been D-Bus activated by it, which needs the
+      # system profile's XDG data directories to be reachable.
+      machine.wait_until_succeeds("pgrep -f '[x]fconfd'", timeout=60)
+
+      # The failsafe session (window manager, panel, ...) is described by
+      # xfce4-session's default xfconf channel, which lives in the package's
+      # etc/xdg and is only found when XDG_CONFIG_DIRS points at the system
+      # profile. Without it the session manager comes up with no clients at all
+      # (an empty desktop) and, depending on the version, aborts with "unable
+      # to determine failsafe session name".
+      machine.wait_until_succeeds("pgrep -f '[x]fwm4'", timeout=120)
+      machine.wait_until_succeeds("pgrep -f '[x]fce4-panel'", timeout=120)
+
+      # The session also has to *see* the variables, not just benefit from them
+      # indirectly. `-z` makes grep split the NUL-separated /proc environ, and
+      # `^...$` anchors the pattern on the exec'ed command name so that neither
+      # the driving `bash -c` wrapper nor the `dbus-run-session` parent matches.
+      session_env = "/proc/$(pgrep -f '^xfce4-session$' | head -n1)/environ"
+      machine.succeed(f"grep -zq '^XDG_DATA_DIRS=.*/run/current-system/sw/share$' {session_env}")
+      machine.succeed(f"grep -zq '^XDG_CONFIG_DIRS=.*/run/current-system/sw/etc/xdg$' {session_env}")
+    '';
+  };
 }

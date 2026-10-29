@@ -32,6 +32,41 @@ let
   resolutionWidth = lib.toInt (lib.elemAt resolution 0);
   resolutionHeight = lib.toInt (lib.elemAt resolution 1);
 
+  # Rebuild a search-path-like session variable the same way NixOS does for a
+  # login session (`/etc/set-environment`): the explicitly configured
+  # `environment.sessionVariables.<name>` (a string or a list) followed by
+  # `environment.profileRelativeSessionVariables.<name>` expanded over every
+  # entry of `environment.profiles`. A system that customises its session
+  # environment is thereby inherited instead of overridden; `fallback` is only
+  # used when nothing at all is defined.
+  #
+  # `environment.profiles` mixes in PAM/shell-expandable entries such as
+  # `$HOME/.nix-profile` or `${XDG_STATE_HOME}/nix/profile`. systemd does not
+  # expand variables in `Environment=`, so `$HOME`/`$USER` are substituted for
+  # the session user and entries using any other variable are dropped.
+  sessionSearchPath =
+    name: fallback:
+    let
+      expand =
+        entry:
+        let
+          substituted =
+            lib.replaceStrings [ "$HOME" "\${HOME}" "$USER" "\${USER}" ] [ userHome userHome cfg.user cfg.user ]
+              entry;
+        in
+        lib.optional (!lib.hasInfix "$" substituted) substituted;
+
+      entries = map toString (
+        lib.toList (config.environment.sessionVariables.${name} or [ ])
+        ++ lib.concatMap (
+          profile:
+          map (suffix: profile + suffix) (config.environment.profileRelativeSessionVariables.${name} or [ ])
+        ) config.environment.profiles
+      );
+      value = lib.concatStringsSep ":" (lib.concatMap expand entries);
+    in
+    if value == "" then fallback else value;
+
   # Basic auth is only meaningful with a password file; without one the
   # password is generated at random and web authentication is switched off
   # (KasmVNC still refuses to start without at least one user entry).
@@ -216,6 +251,12 @@ in
         a D-Bus session bus, so wrap them in `dbus-run-session` (`dbus` is on the
         service's `PATH`), e.g. `"dbus-run-session xfce4-session"`.
 
+        They also need the XDG session environment to find their D-Bus
+        activation files and default configuration; the module provides
+        `XDG_DATA_DIRS` and `XDG_CONFIG_DIRS` for the unit, inherited from the
+        system's session variables and overridable through
+        `systemd.services.kasmvnc.environment.*`.
+
         When `null`, the session runs an `xterm` if one is available and
         otherwise just idles.
       '';
@@ -301,6 +342,24 @@ in
       after = [ "network.target" ];
 
       environment.HOME = userHome;
+
+      # This unit runs a *desktop session*, but as a system service it starts
+      # without the environment a login session gets from `/etc/set-environment`.
+      # Desktop environments rely on the XDG base directory variables:
+      # `XDG_DATA_DIRS` is how the session bus finds D-Bus activation files
+      # (`share/dbus-1/services/org.xfce.Xfconf.service` -> xfconfd) and
+      # `XDG_CONFIG_DIRS` is where their default configuration lives
+      # (`etc/xdg/xfce4/xfconf/xfce-perchannel-xml/`). Without them an XFCE
+      # session comes up with no window manager, or aborts with "unable to
+      # determine failsafe session name. xfconfd isn't running."
+      # The values are inherited from the system session environment and only
+      # defaulted, so `systemd.services.kasmvnc.environment.*` still wins.
+      environment.XDG_DATA_DIRS = lib.mkDefault (
+        sessionSearchPath "XDG_DATA_DIRS" "/run/current-system/sw/share"
+      );
+      environment.XDG_CONFIG_DIRS = lib.mkDefault (
+        sessionSearchPath "XDG_CONFIG_DIRS" "/etc/xdg:/run/current-system/sw/etc/xdg"
+      );
 
       # This service runs a *user session* (window manager, desktop
       # environment helpers), not just module-owned binaries, so the system
