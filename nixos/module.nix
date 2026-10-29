@@ -71,6 +71,94 @@ let
     in
     if value == "" then fallback else value;
 
+  # A login shell expands variables inside `NIX_PROFILES` (`$HOME`, `$USER`,
+  # `${XDG_STATE_HOME}`, ...); systemd's `Environment=` expands nothing at all,
+  # so the expansion is reproduced here: `HOME`/`USER` become the session user's
+  # values and every other variable expands to the empty string - which is what
+  # a shell does with an unset variable (`${XDG_STATE_HOME}/nix/profile` turns
+  # into `/nix/profile`, exactly as in `/etc/set-environment`).
+  expandSessionVariables =
+    value:
+    let
+      known = {
+        HOME = userHome;
+        USER = cfg.user;
+      };
+      # `builtins.split` returns the plain text interleaved with the capture
+      # group lists, one entry for every `$NAME` / `${NAME}` reference found:
+      # [ "before" [ "NAME" null ] "between" [ null "NAME" ] "after" ].
+      pieces = builtins.split "[$][{]([A-Za-z_][A-Za-z0-9_]*)[}]|[$]([A-Za-z_][A-Za-z0-9_]*)" value;
+      render =
+        piece:
+        if builtins.isString piece then
+          piece
+        else
+          let
+            name = if builtins.elemAt piece 0 != null then builtins.elemAt piece 0 else builtins.elemAt piece 1;
+          in
+          known.${name} or "";
+    in
+    lib.concatMapStrings render pieces;
+
+  # `NIX_PROFILES` is the *space* separated list of `environment.profiles` that
+  # `/etc/set-environment` exports for a login session, in the reverse of the
+  # order used for `PATH` (`environment.extraInit`, see
+  # `nixos/modules/programs/environment.nix`), i.e.
+  #   /run/current-system/sw /nix/var/nix/profiles/default ...
+  nixProfiles = lib.concatStringsSep " " (
+    map expandSessionVariables (lib.reverseList (map toString config.environment.profiles))
+  );
+
+  # `NIX_PROFILES` only makes the input-method *modules* discoverable; an
+  # application still has to bridge to them. GTK and Qt do that by themselves
+  # (GTK picks the best locale match from the immodules cache, see
+  # `_gtk_im_module_get_default_context_id`), but Chromium/Electron (WeChat, VS
+  # Code, ...) and plain Qt applications only enable their IME bridge when
+  # `GTK_IM_MODULE` / `QT_IM_MODULE` is set, and XIM clients need
+  # `XMODIFIERS`. A login session gets these from `environment.variables` (that
+  # is where `i18n.inputMethod` writes them), which a system service never sees
+  # either.
+  #
+  # Inheritance first: whatever the system defines for a login session is used
+  # verbatim, so the two environments agree. When the system asks for fcitx5 but
+  # does not define the variables - `i18n.inputMethod.fcitx5.waylandFrontend =
+  # true` makes `i18n.inputMethod` skip `GTK_IM_MODULE`/`QT_IM_MODULE` - the
+  # fcitx5 values are defaulted, otherwise those applications would lose their
+  # IME bridge. Any other framework (ibus, ...) is left to the system: the module
+  # never picks an input method on its own.
+  sessionInputMethodEnvironment =
+    let
+      # `environment.variables` is already normalised to strings by the option's
+      # `apply` (lists joined with `:`, `null` entries dropped), so a missing
+      # entry means "the login session has no such variable".
+      systemVariable = name: config.environment.variables.${name} or null;
+
+      fcitx5 =
+        (config.i18n.inputMethod.enable or false) && (config.i18n.inputMethod.type or null) == "fcitx5";
+
+      fcitx5Defaults = {
+        GTK_IM_MODULE = "fcitx";
+        QT_IM_MODULE = "fcitx";
+        XMODIFIERS = "@im=fcitx";
+      };
+
+      value =
+        name:
+        if systemVariable name != null then
+          systemVariable name
+        else if fcitx5 then
+          fcitx5Defaults.${name}
+        else
+          null;
+
+      inject = name: lib.mkDefault (value name);
+    in
+    lib.genAttrs (builtins.filter (name: value name != null) [
+      "GTK_IM_MODULE"
+      "QT_IM_MODULE"
+      "XMODIFIERS"
+    ]) inject;
+
   # Both units run parts of the same *user session*, so they share environment
   # and `PATH`. The session unit runs a *desktop session* (window manager,
   # desktop environment helpers), not just module-owned binaries, but as a system
@@ -88,11 +176,26 @@ let
   # defaulted, so `systemd.services.<name>.environment.*` still wins.
   sessionEnvironment = {
     HOME = userHome;
+    # A system service has no login shell, so `/etc/profile` never runs for it
+    # and `NIX_PROFILES` is missing from its environment. GTK's NixOS patch
+    # (`pkgs/by-name/gt/gtk3/patches/3.0-immodules.cache.patch`) discovers the
+    # immodules cache by looking for `<profile>/etc/gtk-3.0/immodules.cache` in
+    # every entry of `NIX_PROFILES`; without the variable GTK only knows
+    # `gtk-im-context-simple` and ignores every input-method module (fcitx5,
+    # ibus, ...) that `i18n.inputMethod` installed into the system profile. The
+    # result is that input methods are dead inside the desktop session even
+    # though the system is configured correctly. The value is the same one
+    # `/etc/profile` exports, with the session user substituted; `mkDefault`, so
+    # `systemd.services.<name>.environment.NIX_PROFILES` still wins.
+    NIX_PROFILES = lib.mkDefault nixProfiles;
     XDG_DATA_DIRS = lib.mkDefault (sessionSearchPath "XDG_DATA_DIRS" "/run/current-system/sw/share");
     XDG_CONFIG_DIRS = lib.mkDefault (
       sessionSearchPath "XDG_CONFIG_DIRS" "/etc/xdg:/run/current-system/sw/etc/xdg"
     );
-  };
+  }
+  # `GTK_IM_MODULE`, `QT_IM_MODULE` and `XMODIFIERS`: see
+  # `sessionInputMethodEnvironment`.
+  // sessionInputMethodEnvironment;
 
   # Setting `path` on a unit *replaces* its whole PATH, it does not append to it,
   # hence the system profile is listed explicitly, last, so the module's own
@@ -102,6 +205,17 @@ let
   # profile root and the resulting PATH element is `/run/current-system/sw/bin`.
   # `dbus` provides `dbus-run-session` for desktop environments that need a
   # session bus.
+  #
+  # A login session's `PATH` is built from `environment.profiles` and therefore
+  # also contains the *user* profiles (that is where `nix profile install` and
+  # home-manager put their packages). Those are appended at the end, so they do
+  # not take precedence over the module's own packages, but they have to be
+  # there: GLib's `GDesktopAppInfo` validates a `.desktop` file's `Exec[0]` (and
+  # `TryExec`) with `g_find_program_for_path()` against `PATH` and drops the
+  # application from every launcher when the bare command name is not found
+  # (`gio/gdesktopappinfo.c`, `g_desktop_app_info_load_keyfile`). Without them
+  # exactly those applications disappear from panels/appfinders that install
+  # with a bare `Exec=`, while the ones with an absolute store path still show.
   sessionPath = [
     cfg.package
     pkgs.coreutils
@@ -116,6 +230,8 @@ let
     pkgs.openssl
     pkgs.dbus
     "/run/current-system/sw"
+    "/etc/profiles/per-user/${cfg.user}"
+    "${userHome}/.nix-profile"
   ];
 
   # `ExecSearchPath=` is how systemd resolves a *bare* `ExecStart=` command

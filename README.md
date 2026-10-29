@@ -181,8 +181,80 @@ X 服务器与桌面会话是**两个单元**：
   把 X 服务器“拉死”在启动阶段。
 - **`windowManager = null` 时没有会话单元。** Xvnc 只提供一个空桌面。
 
+## 输入法
+
+输入法在会话里能用，需要**两层**机制，而 systemd 服务两层都拿不到（它们都只由登录会话
+的环境提供）：
+
+1. **`NIX_PROFILES`：让 GTK 找得到 immodules。** nixpkgs 给 GTK3 打的补丁会遍历
+   `NIX_PROFILES` 里的每个 profile，查找 `<profile>/etc/gtk-3.0/immodules.cache`
+   （即 `im-fcitx5.so` 等模块的清单）。该变量只由 `/etc/profile` 在登录 shell 里导出。
+   丢失它的后果是 GTK 只认 `gtk-im-context-simple`（哑输入上下文），系统里装好的输入法
+   在桌面会话内**完全失效**，而且没有任何报错。
+2. **`GTK_IM_MODULE` / `QT_IM_MODULE` / `XMODIFIERS`：让应用真的启用 IME 桥。**
+   GTK 与 Qt 自身会按 locale 从 immodules 缓存里自动选模块，但
+   **Chromium / Electron 系应用（微信、VS Code、Discord 等）不查 GTK 的默认选择，而是
+   显式读 `GTK_IM_MODULE` 决定是否接上输入法桥**；纯 Qt 应用同理看 `QT_IM_MODULE`；
+   XIM 客户端看 `XMODIFIERS`。只注入 `NIX_PROFILES` 时，probe 会报 `fcitx5`，但微信里
+   依然打不出字，原因就在这里。
+
+`kasmvnc-session.service` 是 systemd 系统服务、没有登录 shell，所以模块为两个单元
+注入这些变量：
+
+- **`NIX_PROFILES`**：取值与 `/etc/profile` 完全一致（`environment.profiles` 的逆序、
+  空格分隔，`$HOME` / `$USER` 替换为会话用户，未设置的变量按 shell 语义展开为空），
+  用 `mkDefault` 包裹。
+- **IM 三件套**：优先**继承** `environment.variables` 里系统已定义的值（`i18n.inputMethod`
+  就写在这里，因此会话环境与登录会话一致）；系统没有定义、但 `i18n.inputMethod.enable =
+  true` 且 `type = "fcitx5"` 时，用 `mkDefault` 注入 `GTK_IM_MODULE=fcitx`、
+  `QT_IM_MODULE=fcitx`、`XMODIFIERS=@im=fcitx`；其余情况不注入（模块不替用户选输入法
+  框架）。
+
+四个变量都可以用 `systemd.services.kasmvnc-session.environment.<NAME>` 覆盖。
+
+使用方法是**系统层启用输入法框架**，模块不需要额外配置：
+
+```nix
+# 系统 profile 里就会出现 fcitx5 与其 GTK/Qt immodule，
+# 并生成 /run/current-system/sw/etc/gtk-3.0/immodules.cache
+{
+  i18n.inputMethod = {
+    enable = true;
+    type = "fcitx5";
+    fcitx5.addons = with pkgs; [ fcitx5-rime fcitx5-chinese-addons ];
+  };
+}
+```
+
+验证方式：对第一个机制，`fcitx5-gtk3-immodule-probing` 在会话环境里报告
+`GTK_IM_MODULE=fcitx5`，去掉 `NIX_PROFILES` 则退回 `gtk-im-context-simple`；对第二个机制，
+看会话进程的 environ 里是否有 `GTK_IM_MODULE` / `QT_IM_MODULE`（`kasmvnc-ime` 测试同时
+覆盖两层）。
+
+需要注意的点：
+
+- **`GTK_PATH` 不需要注入。** `environment.profileRelativeSessionVariables` 里的
+  `GTK_PATH` 只影响登录 shell，GTK 靠 `NIX_PROFILES` 已经能定位缓存。
+- **`waylandFrontend = true` 会让登录会话反而缺三件套。** `i18n.inputMethod` 在该选项下
+  只设置 `XMODIFIERS`（Wayland 下不需要 `GTK_IM_MODULE`/`QT_IM_MODULE`），但 X11 会话
+  （本模块）仍然依赖它们。模块会因此在会话里补上 fcitx5 的默认值；如果希望会话环境与
+  登录会话完全一致，可以把 `i18n.inputMethod.fcitx5.waylandFrontend` 关掉。
+- **输入法进程本身仍要自己启动。** 本模块只负责让程序找得到并被允许使用 immodule；
+  fcitx5 守护进程可通过 `i18n.inputMethod` 的 autostart（桌面环境）或自己的 systemd user
+  service 启动。
+
 ## 实现要点
 
+- **会话 `PATH` 包含用户 profile，launcher 才能列出 home-manager 安装的应用。** 模块为
+  两个单元的 `path` 在系统 profile（`/run/current-system/sw`）之后追加
+  `/etc/profiles/per-user/<user>` 与 `~/.nix-profile`（systemd 会为每一项加上 `/bin`、
+  `/sbin`），与登录会话的 `PATH` 语义一致。这不只是「命令能找到」的问题：GLib 的
+  `GDesktopAppInfo` 在加载 `.desktop` 文件时会用 `g_find_program_for_path()` 在进程
+  `PATH` 里校验 `Exec[0]`（以及 `TryExec`），找不到就构造失败并返回 NULL，于是该应用从
+  所有 launcher（panel、whisker menu、appfinder）里**静默消失**——这正是 home-manager
+  安装的、`Exec=` 写裸命令名的应用（如 `zen-beta`、`btm`、`zeditor`）在 kasmvnc 会话里
+  不显示、而 `Exec=` 为绝对 store 路径的应用（如 `wechat`）能显示的原因。补上用户 profile
+  后它们全部正常出现。
 - **裸命令名靠 `ExecSearchPath`**：systemd 本身**不会**用单元的 `PATH` 解析相对
   `ExecStart`（`PATH` 只影响它拉起的进程），因此模块用 `ExecSearchPath=` 把同样的目录
   交给 systemd 查找，`windowManager` 里的裸命令名（如
@@ -217,8 +289,9 @@ X 服务器与桌面会话是**两个单元**：
 ## 限制与非目标
 
 - 单实例、单 display（模块内部结构可按 display 扩展，但不提供多实例 options）。
-- 不打包 kasmweb 容器编排平台；不复刻镜像里的 icewm / fcitx5 / rime / 字体栈，
-  会话内容由使用者通过 `windowManager` 提供。
+- 不打包 kasmweb 容器编排平台；不复刻镜像里的 icewm / 字体栈，会话内容由使用者通过
+  `windowManager` 提供。输入法不由本模块安装（用 `i18n.inputMethod`），模块只保证会话
+  环境能让程序找到**并且真的启用**已装好的 immodule（见上面的「输入法」）。
 - 不提供 VNC viewer 传统客户端协议（`BUILD_VIEWER=OFF`，与上游一致）。
 - GLX 会话依赖运行环境自带的 DRI 驱动；本包把 mesa 的 DRI 驱动链接到
   `$out/lib/dri`，但未做端到端 GL 客户端测试。
@@ -239,5 +312,12 @@ VM 测试：
 - `checks.<sys>.kasmvnc-no-password`：仅 `enable = true` 的默认场景（无会话单元）
 - `checks.<sys>.kasmvnc-path-wm`：只在系统 profile 中的裸命令名 WM 能否被会话单元拉起
 - `checks.<sys>.kasmvnc-xfce`：XDG 会话环境注入（xfconfd、failsafe 会话、面板）
+- `checks.<sys>.kasmvnc-launcher`：会话 `PATH` 含用户 profile（用 PyGObject 调
+  `Gio.DesktopAppInfo` 验证 GLib 能加载 `Exec=` 为裸命令名、程序只在用户 profile 里的
+  `.desktop` 文件）
+- `checks.<sys>.kasmvnc-ime`：两层输入法机制（`NIX_PROFILES` + IM 三件套，`i18n.inputMethod`
+  + fcitx5，用 `fcitx5-gtk3-immodule-probing` 断言 GTK 选中 fcitx5 而不是
+  `gtk-im-context-simple`，并断言会话 environ 里有 `GTK_IM_MODULE` / `QT_IM_MODULE`；
+  两个节点覆盖「继承系统变量」与 `waylandFrontend = true` 时的「模块补默认值」）
 - `checks.<sys>.kasmvnc-session-restart`：会话生命周期（注销 / 崩溃后自动重启、`systemctl
   restart kasmvnc` 级联、`systemctl stop kasmvnc` 全部退出且不复活）

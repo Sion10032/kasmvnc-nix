@@ -50,6 +50,70 @@ let
         windowManager = "dbus-run-session xfce4-session";
       };
     };
+
+  # Node for the input-method regression test: the XFCE desktop of `xfceNode`
+  # plus a system-wide fcitx5 installation (`i18n.inputMethod`), which is what
+  # puts fcitx5's GTK3 immodule and the generated `immodules.cache` into the
+  # system profile. Rime is added as an engine to show that a real Chinese input
+  # method is configured; nothing in the test depends on the engine itself.
+  imeNode =
+    { config, pkgs, ... }:
+    {
+      imports = [ xfceNode ];
+
+      i18n.inputMethod = {
+        enable = true;
+        type = "fcitx5";
+        fcitx5.addons = [ pkgs.fcitx5-rime ];
+      };
+
+      # `fcitx5-gtk3-immodule-probing` (shipped by `fcitx5-with-addons`, which
+      # is what `i18n.inputMethod.package` resolves to) is the oracle of the
+      # test below: it prints which GTK3 input-method module GTK resolves in the
+      # current environment. Listing the package explicitly makes the binary
+      # reachable as /run/current-system/sw/bin/fcitx5-gtk3-immodule-probing.
+      environment.systemPackages = [ config.i18n.inputMethod.package ];
+    };
+
+  # Node for the launcher regression test: the XFCE desktop of `xfceNode` plus
+  # PyGObject, so that the test can ask GLib itself whether it accepts a
+  # `.desktop` file (`Gio.DesktopAppInfo`). The application the test installs is
+  # not part of the system profile on purpose - it simulates a home-manager /
+  # `nix profile install` application that only exists in the *user* profile.
+  launcherNode =
+    { pkgs, ... }:
+    {
+      imports = [ xfceNode ];
+
+      environment.systemPackages = [
+        (pkgs.python3.withPackages (ps: [ ps.pygobject3 ]))
+      ];
+    };
+
+  # Typelibs the PyGObject probe needs: `Gio` comes from GLib itself, which also
+  # ships the `GIRepository` typelib PyGObject loads first.
+  giTypelibPath = pkgs.lib.makeSearchPath "lib/girepository-1.0" [ pkgs.glib ];
+
+  # Asks GLib how it judges a `.desktop` file whose bare `Exec=` only exists in
+  # the user profile: `GDesktopAppInfo` returns NULL there when the program is
+  # not found in `PATH` (PyGObject raises `TypeError` instead of returning None).
+  desktopAppInfoProbe = pkgs.writeText "kasmvnc-desktop-app-info-probe.py" ''
+    import warnings
+
+    import gi
+
+    gi.require_version("Gio", "2.0")
+    from gi.repository import Gio
+
+    warnings.simplefilter("ignore")
+    try:
+        info = Gio.DesktopAppInfo.new_from_filename(
+            "/home/kasm-user/.local/share/applications/kasmvnc-test-app.desktop"
+        )
+    except TypeError:
+        info = None
+    print("DESKTOP_APP_INFO=" + (info.get_name() if info is not None else "NULL"))
+  '';
 in
 {
   # Full scenario: declared password, declared window manager.
@@ -245,6 +309,212 @@ in
       session_env = "/proc/$(pgrep -f '^xfce4-session$' | head -n1)/environ"
       machine.succeed(f"grep -zq '^XDG_DATA_DIRS=.*/run/current-system/sw/share$' {session_env}")
       machine.succeed(f"grep -zq '^XDG_CONFIG_DIRS=.*/run/current-system/sw/etc/xdg$' {session_env}")
+    '';
+  };
+
+  # Regression test for input methods inside the desktop session. Two layers are
+  # needed and both are missing from a system service's environment:
+  #
+  # 1. `NIX_PROFILES` makes the immodules *discoverable*. GTK's NixOS patch looks
+  #    the immodules cache up as `<profile>/etc/gtk-3.0/immodules.cache` for every
+  #    entry of `NIX_PROFILES`; without the variable GTK only finds
+  #    `gtk-im-context-simple` and falls back to dumb, non-IME input, so fcitx5,
+  #    ibus etc. are installed and configured but dead inside the session.
+  # 2. `GTK_IM_MODULE` / `QT_IM_MODULE` (plus `XMODIFIERS`) make applications
+  #    *use* the module. GTK and Qt select on their own, but Chromium/Electron
+  #    (WeChat, VS Code, ...) and plain Qt applications only enable their IME
+  #    bridge when the variable is set - so without it a discoverable module is
+  #    still never loaded by them.
+  #
+  # The oracle is `fcitx5-gtk3-immodule-probing`: it asks GTK3 which IM module it
+  # resolves and prints e.g. `GTK_IM_MODULE=fcitx5` (or
+  # `GTK_IM_MODULE=gtk-im-context-simple` when no module is found), so it
+  # observes the actual selection instead of guessing from process names. It is
+  # started with nothing but the session's own `NIX_PROFILES` - no
+  # `GTK_IM_MODULE`, no `GTK_PATH` - because GTK auto-selects the best module by
+  # locale when the variable is unset.
+  #
+  # Two nodes: `machine` is the ordinary fcitx5 configuration, where
+  # `i18n.inputMethod` defines the input-method variables itself and the module
+  # has to inherit them; `wayland` sets `fcitx5.waylandFrontend = true`, which
+  # makes `i18n.inputMethod` leave `GTK_IM_MODULE`/`QT_IM_MODULE` out of the login
+  # environment (that is the configuration the bug was reported from), so the
+  # module has to supply the fcitx5 values on its own.
+  kasmvnc-ime = pkgs.testers.runNixOSTest {
+    name = "kasmvnc-ime";
+
+    nodes = {
+      machine = imeNode;
+
+      wayland =
+        { ... }:
+        {
+          imports = [ imeNode ];
+
+          i18n.inputMethod.fcitx5.waylandFrontend = true;
+        };
+    };
+
+    testScript = ''
+      def check_session(node, im_variables_from_login_environment):
+          node.wait_for_unit("kasmvnc.service", timeout=300)
+          node.wait_until_succeeds("pgrep -f '[x]fce4-session'", timeout=120)
+
+          # `i18n.inputMethod` put fcitx5's GTK3 module and the immodules cache
+          # into the system profile. The cache is the only place GTK3 can learn
+          # about the module.
+          node.succeed("test -s /run/current-system/sw/etc/gtk-3.0/immodules.cache")
+          node.succeed(
+              "grep -q 'im-fcitx5' /run/current-system/sw/etc/gtk-3.0/immodules.cache"
+          )
+
+          # Layer 1: the session has to *see* `NIX_PROFILES`. It is read out of
+          # the session's own environment (`/proc` is NUL separated, hence `tr`);
+          # deliberately lenient, so that a missing variable is reported by the
+          # oracle below instead of failing on the variable itself.
+          session_pid = node.succeed("pgrep -f '^xfce4-session$' | head -n1").strip()
+          session_env = f"/proc/{session_pid}/environ"
+          session_profiles = node.succeed(
+              f"tr '\\000' '\\n' < {session_env} | sed -n 's/^NIX_PROFILES=//p'"
+          ).strip()
+
+          # The oracle: as the session user, on the session's display, with the
+          # session's `NIX_PROFILES` and nothing else (`env -i`: no
+          # `GTK_IM_MODULE`, no `GTK_PATH`, no `XMODIFIERS`), GTK3 has to resolve
+          # the fcitx5 module. Without `NIX_PROFILES` it prints
+          # `GTK_IM_MODULE=gtk-im-context-simple` and this assertion fails - that
+          # is the first regression this test guards.
+          probe = (
+              "runuser -u kasm-user -- env -i HOME=/home/kasm-user DISPLAY=:1 "
+              "XAUTHORITY=/home/kasm-user/.Xauthority"
+          )
+          out = node.succeed(
+              f"{probe} NIX_PROFILES='{session_profiles}' "
+              "/run/current-system/sw/bin/fcitx5-gtk3-immodule-probing"
+          )
+          assert "GTK_IM_MODULE=fcitx" in out, (
+              f"GTK3 resolved no fcitx5 immodule in the session environment: {out!r}"
+          )
+          assert "gtk-im-context-simple" not in out, (
+              f"GTK3 fell back to the dumb IM context: {out!r}"
+          )
+
+          # `NIX_PROFILES` has to be exactly the value a login shell exports, i.e.
+          # the profile list of `/etc/set-environment` in the same order, with the
+          # session user substituted.
+          node.succeed(
+              f"grep -zq '^NIX_PROFILES=.*/run/current-system/sw' {session_env}"
+          )
+          login_profiles = node.succeed(
+              "su - kasm-user -c 'printf %s \"$NIX_PROFILES\"'"
+          ).strip()
+          assert session_profiles == login_profiles, (
+              f"session NIX_PROFILES {session_profiles!r} != /etc/profile {login_profiles!r}"
+          )
+
+          # Layer 2: the variables Chromium/Electron/Qt need to enable their IME
+          # bridge at all. Whenever the login environment defines
+          # `GTK_IM_MODULE` the module has to inherit it, otherwise it has to
+          # supply the fcitx5 value itself.
+          defines_gtk_im_module = node.succeed(
+              "grep -c '^export GTK_IM_MODULE=' /etc/set-environment || true"
+          ).strip()
+          assert (defines_gtk_im_module != "0") == im_variables_from_login_environment, (
+              "/etc/set-environment defines GTK_IM_MODULE: expected "
+              f"{im_variables_from_login_environment}, got {defines_gtk_im_module} matches"
+          )
+          for name, value in [
+              ("GTK_IM_MODULE", "fcitx"),
+              ("QT_IM_MODULE", "fcitx"),
+              ("XMODIFIERS", "@im=fcitx"),
+          ]:
+              node.succeed(f"grep -zq '^{name}={value}$' {session_env}")
+
+      start_all()
+
+      check_session(machine, True)
+      check_session(wayland, False)
+    '';
+  };
+
+  # Regression test for the *session `PATH`*, i.e. for launcher entries.
+  #
+  # A login session's `PATH` is derived from `environment.profiles` and therefore
+  # contains the *user* profiles (`/etc/profiles/per-user/<user>/bin`,
+  # `~/.nix-profile/bin`, ...), which is where home-manager and
+  # `nix profile install` put their packages. A system service gets none of
+  # that. That matters beyond "a command cannot be found": GLib's
+  # `GDesktopAppInfo` validates a `.desktop` file's `Exec[0]` *and* `TryExec` with
+  # `g_find_program_for_path()` against `PATH` while loading the file and rejects
+  # it (returns no GDesktopAppInfo at all) when the bare command name is not
+  # found (`gio/gdesktopappinfo.c`, `g_desktop_app_info_load_keyfile`). Such an
+  # application then disappears from every launcher - panel, whisker menu,
+  # appfinder - while applications whose `Exec=` is an absolute store path keep
+  # working, which is exactly the pattern that was reported.
+  #
+  # The oracle is GLib itself: a `.desktop` file with a bare `Exec=` whose binary
+  # exists only in the per-user profile is loaded with
+  # `Gio.DesktopAppInfo.new_from_filename()` in the session's own `PATH`, as the
+  # session user, on the session's display. Without the user profiles in `PATH`
+  # GLib returns NULL and the test fails.
+  kasmvnc-launcher = pkgs.testers.runNixOSTest {
+    name = "kasmvnc-launcher";
+
+    nodes.machine = launcherNode;
+
+    testScript = ''
+      start_all()
+
+      machine.wait_for_unit("kasmvnc.service", timeout=300)
+      machine.wait_until_succeeds("pgrep -f '[x]fce4-session'", timeout=120)
+
+      session_pid = machine.succeed("pgrep -f '^xfce4-session$' | head -n1").strip()
+      session_env = f"/proc/{session_pid}/environ"
+
+      # The session's `PATH` is read out of its own environment (`/proc` is NUL
+      # separated, hence `tr`); deliberately lenient, so that a missing user
+      # profile is reported by the oracle below instead of failing on the
+      # extraction itself.
+      session_path = machine.succeed(
+          f"tr '\\000' '\\n' < {session_env} | sed -n 's/^PATH=//p'"
+      ).strip()
+
+      # A home-manager style application: the program exists only in the user
+      # profile, its `.desktop` file names it with a bare `Exec=`.
+      machine.succeed(
+          "install -D -m 0755 /run/current-system/sw/bin/true "
+          "/etc/profiles/per-user/kasm-user/bin/kasmvnc-test-app"
+      )
+      machine.succeed(
+          "mkdir -p /home/kasm-user/.local/share/applications && "
+          "printf '[Desktop Entry]\\nType=Application\\nName=KasmVNC Test App\\n"
+          "Exec=kasmvnc-test-app\\n' "
+          "> /home/kasm-user/.local/share/applications/kasmvnc-test-app.desktop && "
+          "chown -R kasm-user /home/kasm-user/.local"
+      )
+
+      # GLib's own verdict, in the session's own `PATH` (`env -i` keeps anything
+      # from the test driver's environment out of it). Without the user profiles
+      # in `PATH` GLib returns NULL here and this assertion fails.
+      probe = (
+          "runuser -u kasm-user -- env -i HOME=/home/kasm-user DISPLAY=:1 "
+          "XAUTHORITY=/home/kasm-user/.Xauthority "
+          "GI_TYPELIB_PATH=${giTypelibPath} "
+          f"PATH='{session_path}'"
+      )
+      out = machine.succeed(
+          f"{probe} python3 ${desktopAppInfoProbe}"
+      )
+      assert "DESKTOP_APP_INFO=KasmVNC Test App" in out, (
+          f"GLib rejected the launcher entry (GDesktopAppInfo is NULL): {out!r}"
+      )
+
+      # ...and the reason is visible in the session's `PATH` itself: it has to
+      # contain the user profiles, like a login session's `PATH` does.
+      for profile in ["/etc/profiles/per-user/kasm-user", "/home/kasm-user/.nix-profile"]:
+          assert f"{profile}/bin" in session_path.split(":"), (
+              f"session PATH lacks {profile}/bin: {session_path}"
+          )
     '';
   };
 
