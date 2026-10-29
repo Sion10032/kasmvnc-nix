@@ -1,0 +1,163 @@
+# kasmvnc-nix
+
+从源码构建的 [KasmVNC](https://github.com/kasmtech/KasmVNC) Nix 包，以及一个
+`services.kasmvnc` NixOS 模块（systemd 系统服务）。
+
+## 动机
+
+本仓库把一套基于 KasmVNC 的 Docker 桌面镜像（从 Kasm S3 拉取预编译 deb）在 Nix
+生态中原生化：
+
+1. **`kasmvnc` 包**：`Xvnc`、`vncserver`、`kasmvncpasswd` 等二进制与 Perl 脚本由
+   源码构建，Web 前端（`www`）由 kasmtech/noVNC 源码构建（`buildNpmPackage`）。
+   构建过程不依赖任何官方预编译制品（deb / tgz / S3）。
+2. **`services.kasmvnc` 模块**：声明式 options + systemd 服务，替代镜像中
+   `vnc_startup.sh` 的手工流程（自签证书、口令设置、`vncserver` 参数、WM 启动、
+   stale lock 清理）。
+
+## 快速开始
+
+```nix
+# flake.nix
+{
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    kasmvnc-nix.url = "github:<you>/kasmvnc-nix"; # 或 path:/path/to/kasmvnc-nix
+  };
+
+  outputs = { self, nixpkgs, kasmvnc-nix, ... }: {
+    nixosConfigurations.host = nixpkgs.lib.nixosSystem {
+      system = "x86_64-linux";
+      specialArgs = { inherit kasmvnc-nix; };
+      modules = [
+        ./configuration.nix
+        # 或者直接 imports = [ kasmvnc-nix.nixosModules.default ];
+        {
+          services.kasmvnc = {
+            enable = true;
+            passwordFile = "/run/secrets/kasmvnc-password";
+            windowManager = "${pkgs.icewm}/bin/icewm-session";
+            openFirewall = true;
+          };
+        }
+      ];
+    };
+  };
+}
+```
+
+浏览器访问 `https://<host>:6901/`，用 `vncUsername`（默认 `kasm_user`）与
+`passwordFile` 中的口令登录。默认使用自签证书，浏览器会提示证书不受信任。
+
+完整示例见 [`examples/minimal.nix`](examples/minimal.nix)。
+
+不想用模块时，也可以用 overlay 或直接取包：
+
+```nix
+# overlay
+nixpkgs.overlays = [ inputs.kasmvnc-nix.overlays.default ];
+environment.systemPackages = [ pkgs.kasmvnc ];
+
+# 或者
+nix build github:<you>/kasmvnc-nix#kasmvnc
+```
+
+## Options
+
+| Option | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `enable` | bool | `false` | 启用 `kasmvnc.service` |
+| `package` | package | 本 flake 构建的 kasmvnc | 使用的 KasmVNC 包 |
+| `user` | str | `"kasm-user"` | 运行服务的用户；未声明时自动创建为普通用户 |
+| `display` | `^:[1-9][0-9]*$` | `":1"` | X display |
+| `websocketPort` | port | `6901` | HTTPS / WebSocket 端口 |
+| `resolution` | `WxH` | `"1280x720"` | 桌面分辨率 |
+| `colorDepth` | `16 \| 24 \| 32` | `24` | 色深 |
+| `frameRate` | int > 0 | `24` | 最大帧率 |
+| `vncUsername` | str | `"kasm_user"` | Web 登录用户名 |
+| `passwordFile` | path \| null | `null` | 明文口令文件，preStart 用 `kasmvncpasswd` 转换 |
+| `windowManager` | str \| null | `null` | 会话命令（写进 `~/.vnc/xstartup`） |
+| `interface` | str | `"0.0.0.0"` | 监听地址 |
+| `ssl.certFile` | path \| null | `null` | HTTPS 证书；`null` 时自动生成自签证书 |
+| `ssl.keyFile` | path \| null | `null` | HTTPS 私钥；必须与 `certFile` 同时设置 |
+| `openFirewall` | bool | `false` | 放行 `websocketPort` 与 `5900 + N` |
+| `extraConfig` | lines | `""` | 追加到 `/etc/kasmvnc/kasmvnc.yaml` 的 YAML |
+
+### `passwordFile = null` 的语义
+
+KasmVNC 必须有至少一条用户记录才能启动，因此 `passwordFile = null` 时模块会生成一个
+**随机口令**条目（写入 `~/.kasmpasswd`）并给服务加 `-DisableBasicAuth`：能访问
+`websocketPort` 的人可以直接拿到桌面。请只在有鉴权反向代理（SSO / mTLS）时这样用，
+否则请设置 `passwordFile`。
+
+### 证书
+
+不设置 `ssl.certFile` / `ssl.keyFile` 时，preStart 会生成合并式自签证书
+`~/.vnc/self.pem`（`openssl req -x509 -nodes -days 3650 -newkey rsa:2048`，subject 与
+原 Docker 镜像一致）。两者只设置一个是配置错误，模块会通过 assertion 拒绝。
+
+## 与 Docker 镜像用法的映射
+
+| 镜像（`vnc_startup.sh`） | 本模块 |
+|---|---|
+| `VNC_PW` + `echo pw \| kasmvncpasswd -u $VNC_USER -wo` | `passwordFile` + `vncUsername` |
+| `VNC_USER` | `vncUsername` |
+| `VNC_RESOLUTION` | `resolution` |
+| `VNC_COL_DEPTH` | `colorDepth` |
+| `MAX_FRAME_RATE` | `frameRate` |
+| `NO_VNC_PORT` | `websocketPort` |
+| `-httpd ${KASM_VNC_PATH}/www` | 固定为包内的 `share/kasmvnc/www` |
+| `openssl req -x509 ... self.pem` | preStart 自动生成（或 `ssl.certFile` / `ssl.keyFile`） |
+| `rm -rf /tmp/.X*-lock /tmp/.X11-unix ~/.vnc/*.pid` | preStart 清理本 display 的 stale lock / pid |
+| `echo "exit 0" > xstartup` + `icewm-session &` | `windowManager` 写入 `~/.vnc/xstartup` |
+| `src/kasmvnc.yaml`（`/etc/kasmvnc/kasmvnc.yaml`） | 模块生成；额外内容用 `extraConfig` |
+| `tail -f` + 进程守护循环 | systemd（`Restart=on-failure`，`KillMode=control-group`） |
+
+## 实现要点
+
+- **Xvnc 是一个 X server DDX**（`unix/xserver/hw/vnc`），只能通过给 xorg-server 打
+  patch 并一起编译得到，不能简单地链接 nixpkgs 的 `xorgserver`。因此构建时解包
+  nixpkgs `xorg-server` 的源码（21.1.24）到 `unix/xserver`，应用上游
+  `unix/xserver21.patch`，再用 autotools 编译（与上游 `builder/build.sh` 同流程）。
+- **turbojpeg 静态链接**：上游用 `-Wl,-Bstatic -lturbojpeg`，因此 `libjpeg-turbo`
+  以 `enableStatic = true` 覆盖。
+- **SHA-256 crypt**：`kasmvncpasswd` 与 Web 认证使用 `$5$kasm$`，nixpkgs 的
+  `libxcrypt` 默认只启用 "strong" 方案集，需要额外打开 `sha256crypt`。
+- **Perl 依赖**：`vncserver` 是 Perl 脚本，shebang 指向
+  `perl.withPackages`（`ListMoreUtils`、`Switch`、`TryTiny`、`DateTime`、
+  `DateTimeTimeZone`、`YAMLTiny`、`HashMergeSimple`），`KasmVNC::*` 模块通过
+  `PERL5LIB` 提供。
+- **前端**：kasmtech/noVNC 上游没有 `package-lock.json`，本仓库维护一份生成的
+  lockfile（`packages/kasmvnc/package-lock.json`，lockfileVersion 3）。
+
+## 上游版本
+
+| 组件 | 版本 / commit |
+|---|---|
+| kasmtech/KasmVNC | `v1.5.2`（`b3ab9ac88e5283e986c65236cf0ed7462ec1505e`） |
+| kasmtech/noVNC（`kasmweb` 子模块） | `402c0c59d62424ff110bad8f14682deec7d4c780` |
+| xorg-server（取自 nixpkgs） | `21.1.24` |
+
+## 限制与非目标
+
+- 单实例、单 display（模块内部结构可按 display 扩展，但不提供多实例 options）。
+- 不打包 kasmweb 容器编排平台；不复刻镜像里的 icewm / fcitx5 / rime / 字体栈，
+  会话内容由使用者通过 `windowManager` 提供。
+- 不提供 VNC viewer 传统客户端协议（`BUILD_VIEWER=OFF`，与上游一致）。
+- GLX 会话依赖运行环境自带的 DRI 驱动；本包把 mesa 的 DRI 驱动链接到
+  `$out/lib/dri`，但未做端到端 GL 客户端测试。
+- `PIDFile` 使用 `networking.hostName` 拼出 `~/.vnc/<hostname>:<N>.pid`，若在运行时
+  修改 transient hostname，需要重启服务。
+
+## 开发
+
+```bash
+nix build .#kasmvnc          # 构建包
+nix flake check              # 包含两个 NixOS VM 测试
+nix develop                  # nil + nixfmt
+```
+
+VM 测试：
+
+- `checks.<sys>.kasmvnc`：声明口令 + icewm 的完整场景（含 TLS、BasicAuth、重启）
+- `checks.<sys>.kasmvnc-no-password`：仅 `enable = true` 的默认场景

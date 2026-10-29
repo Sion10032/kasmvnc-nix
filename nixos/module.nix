@@ -277,7 +277,8 @@ in
 
     environment.etc."kasmvnc/kasmvnc.yaml".text = kasmvncYaml;
 
-    networking.firewall.allowedTCPPorts = optional cfg.openFirewall cfg.websocketPort ++ optional cfg.openFirewall vncPort;
+    networking.firewall.allowedTCPPorts =
+      optional cfg.openFirewall cfg.websocketPort ++ optional cfg.openFirewall vncPort;
 
     systemd.services.kasmvnc = {
       description = "KasmVNC remote desktop server (${cfg.display})";

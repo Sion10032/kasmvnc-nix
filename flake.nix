@@ -27,6 +27,10 @@
 
       nixosModules.default = import ./nixos/module.nix;
 
+      overlays.default = final: prev: {
+        kasmvnc = final.callPackage ./packages/kasmvnc { };
+      };
+
       devShells = forAllSystems (pkgs: {
         default = pkgs.mkShell {
           packages = [
