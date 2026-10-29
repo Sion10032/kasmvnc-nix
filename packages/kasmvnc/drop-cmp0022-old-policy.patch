@@ -1,0 +1,12 @@
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -3,9 +3,6 @@
+ #
+ 
+ cmake_minimum_required(VERSION 2.8)
+-if(POLICY CMP0022)
+-  cmake_policy(SET CMP0022 OLD)
+-endif()
+ 
+ # Internal cmake modules
+ set(CMAKE_MODULE_PATH ${CMAKE_SOURCE_DIR}/cmake/Modules)
