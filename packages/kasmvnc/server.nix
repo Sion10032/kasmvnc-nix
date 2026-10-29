@@ -64,6 +64,12 @@
 let
   # Upstream links turbojpeg statically (`-Wl,-Bstatic -lturbojpeg`).
   libjpegTurbo = libjpeg_turbo.override { enableStatic = true; };
+
+  # KasmVNC hashes web credentials with SHA-256 crypt (`$5$kasm$`) in both
+  # kasmvncpasswd and Xvnc's websocket auth. nixpkgs' libxcrypt enables the
+  # "strong" scheme set only, which lacks sha256crypt, so crypt() would return
+  # NULL there (and kasmvncpasswd would crash).
+  libcrypt = libxcrypt.override { enableHashes = "strong,sha256crypt"; };
 in
 stdenv.mkDerivation (finalAttrs: {
   pname = "kasmvnc-server";
@@ -122,7 +128,7 @@ stdenv.mkDerivation (finalAttrs: {
     mesa
     libGL
     libGLU
-    libxcrypt
+    libcrypt
     libXtst
     libXi
     libXdamage
