@@ -123,6 +123,10 @@ KasmVNC 必须有至少一条用户记录才能启动，因此 `passwordFile = n
   以 `enableStatic = true` 覆盖。
 - **SHA-256 crypt**：`kasmvncpasswd` 与 Web 认证使用 `$5$kasm$`，nixpkgs 的
   `libxcrypt` 默认只启用 "strong" 方案集，需要额外打开 `sha256crypt`。
+- **ffmpeg（h264 编码）**：上游在运行时扫描 `/usr/lib` 找到并 `dlopen` ffmpeg 的
+  `libavformat.so` 等库。NixOS 没有 `/usr/lib`，因此构建时把 `${ffmpeg}/lib` 加入
+  该扫描列表，并在 `Xvnc` 的 RUNPATH 中补上同一个目录（这些库不在 `DT_NEEDED` 里，
+  不会自动进 RUNPATH）。
 - **Perl 依赖**：`vncserver` 是 Perl 脚本，shebang 指向
   `perl.withPackages`（`ListMoreUtils`、`Switch`、`TryTiny`、`DateTime`、
   `DateTimeTimeZone`、`YAMLTiny`、`HashMergeSimple`），`KasmVNC::*` 模块通过

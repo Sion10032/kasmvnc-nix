@@ -89,6 +89,17 @@ stdenv.mkDerivation (finalAttrs: {
   # there to keep the generated libtool control files in the old format.
   patches = [ ./drop-cmp0022-old-policy.patch ];
 
+  # Xvnc finds its optional ffmpeg runtime by scanning /usr/lib (and dlopen()ing
+  # the bare soname). Those paths never exist on NixOS, so add the real ffmpeg
+  # library directory to the search list; without it video encoders fall back
+  # to jpeg/webp.
+  postPatch = ''
+    substituteInPlace common/rfb/ffmpeg.cxx \
+      --replace-fail \
+        'static constexpr std::array<std::string_view, 2> paths = {"/usr/lib/", "/usr/lib64"};' \
+        'static constexpr std::array<std::string_view, 3> paths = {"/usr/lib/", "/usr/lib64", "${lib.getLib ffmpeg}/lib"};'
+  '';
+
   # The Xvnc automake files resolve the KasmVNC libraries relative to the
   # source tree (KASMVNC_BUILDDIR=${KASMVNC_SRCDIR}), i.e. upstream only
   # supports an in-source build.
@@ -211,7 +222,6 @@ stdenv.mkDerivation (finalAttrs: {
     pushd unix/xserver/hw/vnc
     make install
     popd
-
     # --- Perl modules used by bin/vncserver ---------------------------------
     # Upstream's packages put these into /usr/share/perl5 (a default @INC
     # entry on Debian); on Nix they are found via PERL5LIB, which the wrapper
@@ -231,6 +241,14 @@ stdenv.mkDerivation (finalAttrs: {
     for dri in ${mesa}/lib/dri/*_dri.so; do
       ln -s "$dri" $out/lib/dri/
     done
+  '';
+
+  # Xvnc loads ffmpeg at runtime with dlopen("libavformat.so") (the video
+  # encoders are optional), so those libraries never end up in DT_NEEDED and
+  # therefore never in the auto-generated runpath. Add the ffmpeg library
+  # directory explicitly; without it KasmVNC falls back to jpeg/webp encoders.
+  postFixup = ''
+    patchelf --add-rpath ${lib.getLib ffmpeg}/lib $out/bin/Xvnc
   '';
 
   meta = {
