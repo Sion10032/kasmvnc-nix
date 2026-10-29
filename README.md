@@ -76,7 +76,7 @@ nix build github:<you>/kasmvnc-nix#kasmvnc
 | `frameRate` | int > 0 | `24` | 最大帧率 |
 | `vncUsername` | str | `"kasm_user"` | Web 登录用户名 |
 | `passwordFile` | path \| null | `null` | 明文口令文件，preStart 用 `kasmvncpasswd` 转换 |
-| `windowManager` | str \| null | `null` | 会话命令（写进 `~/.vnc/xstartup`） |
+| `windowManager` | str \| null | `null` | 会话命令（写进 `~/.vnc/xstartup`）；裸名要求程序在系统 profile 中 |
 | `interface` | str | `"0.0.0.0"` | 监听地址 |
 | `ssl.certFile` | path \| null | `null` | HTTPS 证书；`null` 时自动生成自签证书 |
 | `ssl.keyFile` | path \| null | `null` | HTTPS 私钥；必须与 `certFile` 同时设置 |
@@ -95,6 +95,34 @@ KasmVNC 必须有至少一条用户记录才能启动，因此 `passwordFile = n
 不设置 `ssl.certFile` / `ssl.keyFile` 时，preStart 会生成合并式自签证书
 `~/.vnc/self.pem`（`openssl req -x509 -nodes -days 3650 -newkey rsa:2048`，subject 与
 原 Docker 镜像一致）。两者只设置一个是配置错误，模块会通过 assertion 拒绝。
+
+### `windowManager`
+
+`windowManager` 是写进 `~/.vnc/xstartup` 的会话命令，由 `kasmvnc.service`（系统服务）
+中的 X 会话执行。两点需要注意：
+
+1. **裸命令名按服务的 `PATH` 解析。** 给 systemd 单元设置 `path` 会**整体替换**该单元
+   的 `PATH`，而不是追加，因此模块显式在末尾加了系统 profile
+   （`/run/current-system/sw/bin`，见 `nixos/module.nix`）。这意味着裸名只有对**通过
+   系统 profile 可达**的程序才有效，例如
+   `services.xserver.desktopManager.xfce` 或
+   `environment.systemPackages = [ pkgs.xfce.xfce4-session ]`。没有装到系统 profile
+   的程序必须写 store 路径。
+2. **桌面环境需要 D-Bus 会话总线。** `xfce4-session` 等在没有会话总线时会拒绝启动
+   （xstartup 会 `unset DBUS_SESSION_BUS_ADDRESS`，沿用上游镜像的做法），因此要用
+   `dbus-run-session` 包裹；`dbus` 已在服务 `PATH` 中，可以裸名调用。
+
+```nix
+# 1) 裸名 + D-Bus 会话总线（程序需系统级安装，如 services.xserver.desktopManager.xfce）
+services.kasmvnc.windowManager = "dbus-run-session xfce4-session";
+
+# 2) store 路径：不依赖系统 profile；DE 仍需 dbus-run-session 包裹
+services.kasmvnc.windowManager =
+  "dbus-run-session ${pkgs.xfce.xfce4-session}/bin/xfce4-session";
+
+# 3) 不需要会话总线的窗口管理器，store 路径即可
+services.kasmvnc.windowManager = "${pkgs.icewm}/bin/icewm-session";
+```
 
 ## 与 Docker 镜像用法的映射
 
@@ -157,7 +185,7 @@ KasmVNC 必须有至少一条用户记录才能启动，因此 `passwordFile = n
 
 ```bash
 nix build .#kasmvnc          # 构建包
-nix flake check              # 包含两个 NixOS VM 测试
+nix flake check              # 包含三个 NixOS VM 测试
 nix develop                  # nil + nixfmt
 ```
 
@@ -165,3 +193,4 @@ VM 测试：
 
 - `checks.<sys>.kasmvnc`：声明口令 + icewm 的完整场景（含 TLS、BasicAuth、重启）
 - `checks.<sys>.kasmvnc-no-password`：仅 `enable = true` 的默认场景
+- `checks.<sys>.kasmvnc-path-wm`：只在系统 profile 中的裸命令名 WM 能否被 xstartup 拉起

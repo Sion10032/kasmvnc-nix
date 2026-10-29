@@ -120,4 +120,54 @@ in
       machine.succeed("test -s /home/kasm-user/.kasmpasswd")
     '';
   };
+
+  # A bare command name (no store path) has to resolve through the system
+  # profile: the module's `systemd.services.kasmvnc.path` replaces the unit's
+  # whole PATH, so /run/current-system/sw/bin has to be appended explicitly.
+  kasmvnc-path-wm = pkgs.testers.runNixOSTest {
+    name = "kasmvnc-path-wm";
+
+    nodes.machine =
+      { pkgs, ... }:
+      let
+        # Pseudo window manager that just keeps running. It is only installed
+        # through `environment.systemPackages`, i.e. it is reachable as a bare
+        # command name via /run/current-system/sw/bin and nowhere else.
+        # No `exec`: exec'ing would replace this process image, so the bare
+        # command name would vanish from the process table and `pgrep` could not
+        # observe that resolution actually worked.
+        testWm = pkgs.runCommand "kasmvnc-test-wm" { } ''
+          install -d "$out/bin"
+          printf '#!/bin/sh\nsleep infinity\n' > "$out/bin/kasmvnc-test-wm"
+          chmod 755 "$out/bin/kasmvnc-test-wm"
+        '';
+      in
+      {
+        imports = [
+          kasmvncModule
+          common
+        ];
+
+        environment.systemPackages = [ testWm ];
+
+        services.kasmvnc = {
+          enable = true;
+          windowManager = "kasmvnc-test-wm";
+        };
+      };
+
+    testScript = ''
+      start_all()
+
+      machine.wait_for_unit("kasmvnc.service", timeout=300)
+
+      # The generated xstartup execs the bare command name, so the name has to
+      # be resolvable through the service's PATH and the window manager has to
+      # be running afterwards. The bracket in the pattern keeps the test
+      # driver's own `bash -c ...` wrapper (whose argv contains the pattern)
+      # from matching itself.
+      machine.wait_until_succeeds("pgrep -f '[k]asmvnc-test-wm'", timeout=120)
+      machine.succeed("pgrep -af '[k]asmvnc-test-wm' | grep -q /run/current-system/sw/bin")
+    '';
+  };
 }

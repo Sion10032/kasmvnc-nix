@@ -198,11 +198,26 @@ in
     windowManager = mkOption {
       type = types.nullOr types.str;
       default = null;
-      example = lib.literalExpression ''"''${pkgs.icewm}/bin/icewm-session"'';
+      example = "dbus-run-session xfce4-session";
       description = ''
         Command executed by the generated `~/.vnc/xstartup`, e.g.
-        `"''${pkgs.icewm}/bin/icewm-session"`. When `null`, the session runs an
-        `xterm` if one is available and otherwise just idles.
+        `"''${pkgs.icewm}/bin/icewm-session"`.
+
+        A bare command name is looked up in the service's `PATH`, which consists
+        of the packages this module needs plus `/run/current-system/sw/bin`.
+        Setting `path` on a unit *replaces* its `PATH`, so the system profile is
+        added explicitly; a bare name therefore only resolves for programs that
+        are installed through the system profile (e.g.
+        `services.xserver.desktopManager.xfce` or
+        `environment.systemPackages`). Everything else needs an absolute store
+        path such as `"''${pkgs.icewm}/bin/icewm-session"`.
+
+        Desktop environments (and window managers that use a session bus) need
+        a D-Bus session bus, so wrap them in `dbus-run-session` (`dbus` is on the
+        service's `PATH`), e.g. `"dbus-run-session xfce4-session"`.
+
+        When `null`, the session runs an `xterm` if one is available and
+        otherwise just idles.
       '';
     };
 
@@ -287,6 +302,17 @@ in
 
       environment.HOME = userHome;
 
+      # This service runs a *user session* (window manager, desktop
+      # environment helpers), not just module-owned binaries, so the system
+      # profile has to stay reachable. Setting `path` replaces the unit's whole
+      # PATH, it does not append to it, hence the system profile is listed
+      # explicitly, last, so the module's own packages keep precedence. This is
+      # what makes a bare command name such as `xfce4-session` (installed via
+      # `environment.systemPackages` / a desktop module) resolvable.
+      # Every entry gets `/bin` appended, so the entry is the profile root and
+      # the resulting PATH element is `/run/current-system/sw/bin`.
+      # `dbus` provides `dbus-run-session` for desktop environments that need a
+      # session bus.
       path = [
         cfg.package
         pkgs.coreutils
@@ -299,6 +325,8 @@ in
         pkgs.xrdb
         pkgs.xterm
         pkgs.openssl
+        pkgs.dbus
+        "/run/current-system/sw"
       ];
 
       serviceConfig = {
