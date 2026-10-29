@@ -20,6 +20,36 @@ let
       documentation.enable = false;
       documentation.nixos.enable = false;
     };
+
+  # A real desktop environment, installed through the system profile only (no
+  # `services.xserver`, no display manager). XFCE is the environment the
+  # reference container image ships, and it is the one whose session manager
+  # exits when the user logs out - the case the session unit has to survive.
+  #
+  # `xfce4-session` plus the clients of its failsafe session (`xfwm4`,
+  # `xfsettingsd`, `xfce4-panel`, ...) are needed for a complete desktop.
+  xfceNode =
+    { pkgs, ... }:
+    {
+      imports = [
+        kasmvncModule
+        common
+      ];
+
+      environment.systemPackages = with pkgs; [
+        xfce4-session
+        xfconf
+        xfwm4
+        xfdesktop
+        xfce4-panel
+        xfce4-settings
+      ];
+
+      services.kasmvnc = {
+        enable = true;
+        windowManager = "dbus-run-session xfce4-session";
+      };
+    };
 in
 {
   # Full scenario: declared password, declared window manager.
@@ -185,31 +215,7 @@ in
   kasmvnc-xfce = pkgs.testers.runNixOSTest {
     name = "kasmvnc-xfce";
 
-    nodes.machine =
-      { pkgs, ... }:
-      {
-        imports = [
-          kasmvncModule
-          common
-        ];
-
-        environment.systemPackages = with pkgs; [
-          # xfce4-session itself plus the clients of its failsafe session
-          # (`xfwm4`, `xfsettingsd`, `xfce4-panel`, ...), installed through the
-          # system profile only.
-          xfce4-session
-          xfconf
-          xfwm4
-          xfdesktop
-          xfce4-panel
-          xfce4-settings
-        ];
-
-        services.kasmvnc = {
-          enable = true;
-          windowManager = "dbus-run-session xfce4-session";
-        };
-      };
+    nodes.machine = xfceNode;
 
     testScript = ''
       start_all()
@@ -239,6 +245,97 @@ in
       session_env = "/proc/$(pgrep -f '^xfce4-session$' | head -n1)/environ"
       machine.succeed(f"grep -zq '^XDG_DATA_DIRS=.*/run/current-system/sw/share$' {session_env}")
       machine.succeed(f"grep -zq '^XDG_CONFIG_DIRS=.*/run/current-system/sw/etc/xdg$' {session_env}")
+    '';
+  };
+
+  # Regression test for the *lifecycle* of the desktop session.
+  #
+  # The window manager used to be exec'ed from `~/.vnc/xstartup`, i.e. it was a
+  # child of the X session started by `vncserver`. When it exited - XFCE's "log
+  # out" makes `xfce4-session` terminate every client and exit, a crashing
+  # window manager does the same - nothing brought it back: Xvnc keeps running
+  # (`auto_shutdown` is `never` by default), so the web client showed an empty
+  # black desktop until someone ran `systemctl restart kasmvnc`.
+  #
+  # The session now lives in its own unit (`kasmvnc-session.service`) that runs
+  # the window manager as its main process, restarts it when it dies and is
+  # bound to the server unit in both directions (start/stop/restart).
+  kasmvnc-session-restart = pkgs.testers.runNixOSTest {
+    name = "kasmvnc-session-restart";
+
+    nodes.machine = xfceNode;
+
+    testScript = ''
+      start_all()
+
+      machine.wait_for_unit("kasmvnc.service", timeout=300)
+      machine.wait_for_unit("kasmvnc-session.service", timeout=300)
+      machine.wait_until_succeeds("pgrep -f '[x]fce4-session'", timeout=120)
+      machine.wait_until_succeeds("pgrep -f '[x]fce4-panel'", timeout=120)
+
+      # The session is not a child of the X server any more: it is a unit of its
+      # own, and that unit's main process is the window manager / session
+      # manager (`dbus-run-session` forks it and waits for it).
+      machine.succeed("systemctl is-active kasmvnc-session.service")
+      session_main = int(
+          machine.succeed("systemctl show -p MainPID --value kasmvnc-session.service")
+      )
+      machine.succeed(
+          f"[ \"$(ps -o ppid= -p {session_main} | tr -d ' ')\" = 1 ]"
+      )
+
+      # ...while Xvnc stays in the server unit's cgroup and the desktop
+      # processes are in the session unit's cgroup.
+      machine.succeed("grep -q '/kasmvnc.service' /proc/$(pgrep -f 'Xvnc :1' | head -n1)/cgroup")
+      machine.succeed(
+          "grep -q 'kasmvnc-session.service' "
+          "/proc/$(pgrep -f '^xfce4-session$' | head -n1)/cgroup"
+      )
+
+      # Lifecycle supervision, clean exit: SIGTERM is what a plain `pkill`
+      # sends, and `xfce4-session` handles it by ending the session and exiting
+      # *successfully* - which is exactly what "log out" does (exit code 0).
+      # `Restart=on-failure` would leave the desktop dead here, so this is the
+      # assertion that covers the reported log-out case.
+      machine.succeed("pkill -TERM -f '[x]fce4-session'")
+      machine.wait_until_fails("pgrep -f '[x]fce4-session'", timeout=60)
+      machine.wait_until_succeeds("pgrep -f '[x]fce4-session'", timeout=60)
+      # The restarted session is complete again, i.e. the X server was never
+      # torn down and the desktop is usable without a manual restart.
+      machine.wait_until_succeeds("pgrep -f '[x]fce4-panel'", timeout=120)
+      machine.succeed("pgrep -f 'Xvnc :1' >/dev/null")
+      machine.succeed("systemctl is-active kasmvnc-session.service")
+
+      # Lifecycle supervision, crash: an uncleanly dying window manager has to
+      # be restarted as well.
+      machine.succeed("pkill -KILL -f '[x]fce4-session'")
+      machine.wait_until_fails("pgrep -f '[x]fce4-session'", timeout=60)
+      machine.wait_until_succeeds("pgrep -f '[x]fce4-session'", timeout=60)
+      machine.wait_until_succeeds("pgrep -f '[x]fce4-panel'", timeout=120)
+      machine.succeed("systemctl is-active kasmvnc-session.service")
+
+      # Restarting the server unit has to carry the session along (PartOf), and
+      # the session must wait for the new X socket instead of crashing on a
+      # display that is not there yet.
+      machine.succeed("systemctl restart kasmvnc.service")
+      machine.wait_for_unit("kasmvnc.service", timeout=300)
+      machine.wait_for_unit("kasmvnc-session.service", timeout=300)
+      machine.wait_until_succeeds("pgrep -f '[x]fce4-session'", timeout=120)
+      machine.wait_until_succeeds("pgrep -f '[x]fwm4'", timeout=120)
+
+      # Stopping the server must stop everything: the session first (ordering),
+      # then Xvnc. A supervised session must not survive its server, and it must
+      # not be pulled back up by Restart= either.
+      machine.succeed("systemctl stop kasmvnc.service")
+      machine.fail("systemctl is-active kasmvnc-session.service")
+      machine.fail("systemctl is-active kasmvnc.service")
+      machine.fail("pgrep -f '[x]fce4-session'")
+      machine.fail("pgrep -f 'Xvnc :1'")
+      machine.fail("test -e /tmp/.X11-unix/X1")
+      # Nothing comes back on its own after the stop.
+      machine.sleep(10)
+      machine.fail("systemctl is-active kasmvnc-session.service")
+      machine.fail("pgrep -f '[x]fce4-session'")
     '';
   };
 }

@@ -12,8 +12,8 @@
    源码构建，Web 前端（`www`）由 kasmtech/noVNC 源码构建（`buildNpmPackage`）。
    构建过程不依赖任何官方预编译制品（deb / tgz / S3）。
 2. **`services.kasmvnc` 模块**：声明式 options + systemd 服务，替代镜像中
-   `vnc_startup.sh` 的手工流程（自签证书、口令设置、`vncserver` 参数、WM 启动、
-   stale lock 清理）。
+   `vnc_startup.sh` 的手工流程（自签证书、口令设置、`vncserver` 参数、WM 启动与
+   守护、stale lock 清理）。
 
 ## 快速开始
 
@@ -76,7 +76,7 @@ nix build github:<you>/kasmvnc-nix#kasmvnc
 | `frameRate` | int > 0 | `24` | 最大帧率 |
 | `vncUsername` | str | `"kasm_user"` | Web 登录用户名 |
 | `passwordFile` | path \| null | `null` | 明文口令文件，preStart 用 `kasmvncpasswd` 转换 |
-| `windowManager` | str \| null | `null` | 会话命令（写进 `~/.vnc/xstartup`）；裸名要求程序在系统 profile 中 |
+| `windowManager` | str \| null | `null` | 会话命令（`kasmvnc-session.service` 的 `ExecStart`）；裸名要求程序在系统 profile 中 |
 | `interface` | str | `"0.0.0.0"` | 监听地址 |
 | `ssl.certFile` | path \| null | `null` | HTTPS 证书；`null` 时自动生成自签证书 |
 | `ssl.keyFile` | path \| null | `null` | HTTPS 私钥；必须与 `certFile` 同时设置 |
@@ -98,19 +98,20 @@ KasmVNC 必须有至少一条用户记录才能启动，因此 `passwordFile = n
 
 ### `windowManager`
 
-`windowManager` 是写进 `~/.vnc/xstartup` 的会话命令，由 `kasmvnc.service`（系统服务）
-中的 X 会话执行。三点需要注意：
+`windowManager` 是 `kasmvnc-session.service` 的 `ExecStart`：`kasmvnc.service` 只负责 X
+服务器，桌面会话由独立单元运行并被守护（见下面的「会话生命周期」）。四点需要注意：
 
-1. **裸命令名按服务的 `PATH` 解析。** 给 systemd 单元设置 `path` 会**整体替换**该单元
-   的 `PATH`，而不是追加，因此模块显式在末尾加了系统 profile
-   （`/run/current-system/sw/bin`，见 `nixos/module.nix`）。这意味着裸名只有对**通过
-   系统 profile 可达**的程序才有效，例如
+1. **裸命令名按单元的查找路径解析。** 这是 systemd 的 `ExecStart`，不是 shell 命令
+   行：按空白切分，不支持管道、重定向、`&&`、`exec` 等 shell 语法（需要时写包装脚本）。
+   裸名由 `ExecSearchPath=` 解析，模块把与单元 `PATH` 相同的目录填进去（模块自己的包 +
+   `/run/current-system/sw/bin`）。给单元设置 `path` 会**整体替换**它的 `PATH`，所以系统
+   profile 是显式加上的。这意味着裸名只有对**通过系统 profile 可达**的程序才有效，例如
    `services.xserver.desktopManager.xfce` 或
    `environment.systemPackages = [ pkgs.xfce.xfce4-session ]`。没有装到系统 profile
    的程序必须写 store 路径。
 2. **桌面环境需要 D-Bus 会话总线。** `xfce4-session` 等在没有会话总线时会拒绝启动
-   （xstartup 会 `unset DBUS_SESSION_BUS_ADDRESS`，沿用上游镜像的做法），因此要用
-   `dbus-run-session` 包裹；`dbus` 已在服务 `PATH` 中，可以裸名调用。
+   （会话单元会 unset `DBUS_SESSION_BUS_ADDRESS`，对应原先 xstartup 的做法），因此要用
+   `dbus-run-session` 包裹；`dbus` 已在单元查找路径中，可以裸名调用。
 3. **桌面环境所需的 XDG 会话环境由模块注入。** 系统服务拿不到登录会话的环境
    （`/etc/set-environment`），而桌面环境依赖它：`XDG_DATA_DIRS` 决定会话总线的
    D-Bus activation 能否找到 `share/dbus-1/services/*.service`（例如
@@ -120,8 +121,10 @@ KasmVNC 必须有至少一条用户记录才能启动，因此 `passwordFile = n
    （`environment.sessionVariables` 加上 `environment.profileRelativeSessionVariables`
    对 `environment.profiles` 的展开，与登录会话的算法一致）；系统自定义过 session
    环境时服务会一并跟上。需要覆盖时用
-   `systemd.services.kasmvnc.environment.XDG_DATA_DIRS` /
+   `systemd.services.kasmvnc-session.environment.XDG_DATA_DIRS` /
    `.XDG_CONFIG_DIRS`（模块用的是 `mkDefault`）。
+4. **`windowManager = null` 时没有会话服务。** Xvnc 会带着一个空桌面（占位的
+   `~/.vnc/xstartup` 只 `exit 0`）运行，没有 `kasmvnc-session.service`。
 
 ```nix
 # 1) 裸名 + D-Bus 会话总线（程序需系统级安装，如 services.xserver.desktopManager.xfce）
@@ -148,12 +151,42 @@ services.kasmvnc.windowManager = "${pkgs.icewm}/bin/icewm-session";
 | `-httpd ${KASM_VNC_PATH}/www` | 固定为包内的 `share/kasmvnc/www` |
 | `openssl req -x509 ... self.pem` | preStart 自动生成（或 `ssl.certFile` / `ssl.keyFile`） |
 | `rm -rf /tmp/.X*-lock /tmp/.X11-unix ~/.vnc/*.pid` | preStart 清理本 display 的 stale lock / pid |
-| `echo "exit 0" > xstartup` + `icewm-session &` | `windowManager` 写入 `~/.vnc/xstartup` |
+| `echo "exit 0" > xstartup` | preStart 写入占位的 `~/.vnc/xstartup`（仅 `exit 0`） |
+| `icewm-session &` + 看门狗循环 | `kasmvnc-session.service`（`Restart=always` + `RestartSec=2`） |
 | `src/kasmvnc.yaml`（`/etc/kasmvnc/kasmvnc.yaml`） | 模块生成；额外内容用 `extraConfig` |
-| `tail -f` + 进程守护循环 | systemd（`Restart=on-failure`，`KillMode=control-group`） |
+| `tail -f` + 进程守护循环 | systemd（`Restart=on-failure` / `Restart=always`、`KillMode=control-group`） |
+
+## 会话生命周期
+
+X 服务器与桌面会话是**两个单元**：
+
+| 单元 | 职责 |
+|---|---|
+| `kasmvnc.service` | `vncserver` / `Xvnc`、TLS、Web 前端；生成的 `~/.vnc/xstartup` 只 `exit 0` |
+| `kasmvnc-session.service`（仅 `windowManager != null` 时存在） | 运行并守护 `windowManager`（桌面会话） |
+
+`kasmvnc-session.service` 的主进程就是窗口管理器 / 会话管理器，`Restart=always`，
+`RestartSec=2`：
+
+- **注销或崩溃后自动重启。** 在 XFCE 里注销会让 `xfce4-session` 终止全部会话程序并
+  **以 0 退出**，窗口管理器崩溃则可能是任意退出码。两种情况 systemd 都会把会话拉回来
+  （等效于镜像 `vnc_startup.sh` 里「Window manager crashed, restarting」的看门狗循环），
+  而 Xvnc 不受影响、Web 端重新拿到可用桌面。注意这里必须是 `always` 而不是
+  `on-failure`：注销是「成功退出」，`on-failure` 不会重启，桌面会停在黑屏。
+- **彻底停止用 `systemctl stop kasmvnc`。** 会话单元带 `PartOf=kasmvnc.service`，主服务
+  停止/重启时会话跟随；`After=kasmvnc.service` 保证停止时**先停会话、再 `vncserver -kill`**。
+  显式 `stop` 不会触发 `Restart=`（systemd 对 stop job 从不自动重启），所以停完就真的停了。
+- **会话启动前等 X socket。** 主服务是 `Type=forking`，`After=` 不代表 Xvnc 已经开始监听，
+  所以会话单元的 `ExecStartPre` 会循环等 `/tmp/.X11-unix/X<N>`（最长 60s），避免窗口管理器
+  把 X 服务器“拉死”在启动阶段。
+- **`windowManager = null` 时没有会话单元。** Xvnc 只提供一个空桌面。
 
 ## 实现要点
 
+- **裸命令名靠 `ExecSearchPath`**：systemd 本身**不会**用单元的 `PATH` 解析相对
+  `ExecStart`（`PATH` 只影响它拉起的进程），因此模块用 `ExecSearchPath=` 把同样的目录
+  交给 systemd 查找，`windowManager` 里的裸命令名（如
+  `dbus-run-session xfce4-session`）才能生效。
 - **Xvnc 是一个 X server DDX**（`unix/xserver/hw/vnc`），只能通过给 xorg-server 打
   patch 并一起编译得到，不能简单地链接 nixpkgs 的 `xorgserver`。因此构建时解包
   nixpkgs `xorg-server` 的源码（21.1.24）到 `unix/xserver`，应用上游
@@ -196,12 +229,15 @@ services.kasmvnc.windowManager = "${pkgs.icewm}/bin/icewm-session";
 
 ```bash
 nix build .#kasmvnc          # 构建包
-nix flake check              # 包含三个 NixOS VM 测试
+nix flake check              # 包含全部 NixOS VM 测试
 nix develop                  # nil + nixfmt
 ```
 
 VM 测试：
 
 - `checks.<sys>.kasmvnc`：声明口令 + icewm 的完整场景（含 TLS、BasicAuth、重启）
-- `checks.<sys>.kasmvnc-no-password`：仅 `enable = true` 的默认场景
-- `checks.<sys>.kasmvnc-path-wm`：只在系统 profile 中的裸命令名 WM 能否被 xstartup 拉起
+- `checks.<sys>.kasmvnc-no-password`：仅 `enable = true` 的默认场景（无会话单元）
+- `checks.<sys>.kasmvnc-path-wm`：只在系统 profile 中的裸命令名 WM 能否被会话单元拉起
+- `checks.<sys>.kasmvnc-xfce`：XDG 会话环境注入（xfconfd、failsafe 会话、面板）
+- `checks.<sys>.kasmvnc-session-restart`：会话生命周期（注销 / 崩溃后自动重启、`systemctl
+  restart kasmvnc` 级联、`systemctl stop kasmvnc` 全部退出且不复活）
