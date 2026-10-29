@@ -8,6 +8,8 @@
   coreutils,
   bash,
   procps,
+  hostname,
+  util-linux,
   gnugrep,
   gnused,
   xauth,
@@ -41,6 +43,8 @@ let
     coreutils
     bash
     procps
+    hostname
+    util-linux
     gnugrep
     gnused
     xauth

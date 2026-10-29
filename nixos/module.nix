@@ -328,7 +328,9 @@ in
         ExecStop = "${cfg.package}/bin/vncserver -kill ${cfg.display}";
         # vncserver names its PID file after the host and the display:
         #   ~/.vnc/<hostname>:<N>.pid
-        PIDFile = "%h/.vnc/%H${cfg.display}.pid";
+        # `%h` would be root's home here, and `uname -n` is the configured
+        # host name, so both parts are spelled out literally.
+        PIDFile = "${userHome}/.vnc/${config.networking.hostName}${cfg.display}.pid";
         Restart = "on-failure";
         RestartSec = 5;
         # Xvnc is the long-lived process, but the session (window manager)

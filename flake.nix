@@ -17,6 +17,14 @@
         kasmvnc = pkgs.callPackage ./packages/kasmvnc { };
       });
 
+      checks = forAllSystems (
+        pkgs:
+        import ./tests/kasmvnc.nix {
+          inherit pkgs;
+          kasmvncModule = self.nixosModules.default;
+        }
+      );
+
       nixosModules.default = import ./nixos/module.nix;
 
       devShells = forAllSystems (pkgs: {
