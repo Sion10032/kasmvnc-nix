@@ -464,6 +464,14 @@ in
         from the login environment, which is what their D-Bus activation files and
         default configuration are found through.
 
+        That bus is shared by *all* desktops of the user, so a single-instance
+        desktop environment (XFCE's `xfce4-session` claims `org.xfce.SessionManager`)
+        collides with another graphical session of the same user - an xrdp / display
+        manager desktop, or what is left of one. The second instance then initialises
+        and exits with status 0 without a diagnostic, and `Restart=always` turns that
+        into an endless restart loop. Give each desktop its own session bus in that
+        case: `windowManager = "dbus-run-session xfce4-session"` (see the README).
+
         When `null`, there is no `kasmvnc-session.service` at all: Xvnc runs with
         an empty desktop that only a VNC client can use.
       '';

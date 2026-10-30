@@ -110,7 +110,10 @@ KasmVNC 必须有至少一条用户记录才能启动，因此 `passwordFile = n
    自己的包都在其中。其余程序用 store 路径。
 2. **D-Bus 会话总线由 PAM 会话提供。** `pam_systemd` 注册 logind 会话时会启动 user
    manager 和用户总线，wrapper 等它就绪并导出 `DBUS_SESSION_BUS_ADDRESS`，所以
-   `dbus-run-session` 不再是必需的（保留也可以，只是再起一条会话总线）。
+   `dbus-run-session` 不再是必需的（保留也可以，只是再起一条会话总线）。**例外**：同一
+   用户同时还跑着别的图形会话（xrdp、显示管理器）时，XFCE 这类单实例桌面环境会在共享
+   的 user bus 上撞名，这时必须保留 `dbus-run-session` 前缀，见
+   「多桌面并存与 D-Bus 单实例」。
 3. **XDG 会话环境来自 `/etc/profile`。** 桌面环境依赖 `XDG_DATA_DIRS`（决定会话总线的
    D-Bus activation 能否找到 `share/dbus-1/services/*.service`，例如
    `org.xfce.Xfconf.service` → `xfconfd`）与 `XDG_CONFIG_DIRS`（默认配置位置，例如
@@ -239,10 +242,104 @@ su - <user> -c 'printenv NIX_PROFILES'
 | `systemd.services.kasmvnc-session.environment.NIX_PROFILES` / `.XDG_DATA_DIRS` / `.XDG_CONFIG_DIRS` | 同上 |
 | `systemd.services.kasmvnc-session.path` 里的用户 profile（`/etc/profiles/per-user/<user>`、`~/.nix-profile`）| wrapper 前置追加 |
 | `GTK_IM_MODULE` / `QT_IM_MODULE` / `XMODIFIERS` 的手工设置 | 系统 `i18n.inputMethod` 已定义时由登录会话提供（`waylandFrontend = true` 时保留模块默认值）|
-| `windowManager` 外层的 `dbus-run-session` | PAM 会话已提供 user bus（保留也仍然能工作）|
+| `windowManager` 外层的 `dbus-run-session` | PAM 会话已提供 user bus（保留也仍然能工作；**同一用户还有别的图形会话时应保留**，见「多桌面并存与 D-Bus 单实例」）|
 
 迁移后需要验证的四项：注销/重启后桌面回来、`loginctl list-sessions` 里有 `kasm-user`
 会话、rime 能输入、launcher（panel / whisker menu）里 home-manager 安装的应用仍在。
+
+## 多桌面并存与 D-Bus 单实例
+
+上一节的登录语义把会话挂到了**用户的** D-Bus 会话总线上（`DBUS_SESSION_BUS_ADDRESS`
+= `unix:path=/run/user/<uid>/bus`）。这条总线是**每个用户一条**，不是每个桌面一条，
+于是同一用户的多个图形会话会在上面互相碰撞。
+
+### 现象
+
+同一用户已经有一个 XFCE 图形会话（xrdp、另一个显示管理器，或它们的残留进程）时，
+kasmvnc 的桌面起不来，而且几乎不留下任何线索：
+
+- `journalctl -u kasmvnc-session` 里每 ~2 秒一轮
+  `kasmvnc-session.service: Deactivated successfully.`，restart counter 很快破百；
+- **没有任何** wrapper 或窗口管理器的错误输出（不是缺库，也不是 display 打不开）；
+- `systemctl show kasmvnc-session -p ExecMainStatus` 为 `0`，所以 `Restart=always`
+  每轮都会把它重新拉起；
+- `/tmp/.ICE-unix/` 里每轮留下一个以 pid 命名的 socket，说明 `xfce4-session` 初始化到
+  ICE 阶段才退出；
+- `busctl --user list | grep -i xfce` 能看到 `org.xfce.SessionManager` 被**另一个**会话
+  的 `xfce4-session` 持有。
+
+### 根因
+
+`xfce4-session` 是单实例服务：它在会话总线上申请 `org.xfce.SessionManager` 这个名字。
+第二个实例启动时先完成初始化（建 ICE socket、拉起 `xfwm4` 等），然后在总线上发现名字
+已被占用 → **静默退出，状态码 0**。`Restart=always`（见「会话生命周期」，注销本来就会
+以 0 退出，所以这里必须是 `always`）于是每 `RestartSec=2` 把这个「成功退出」的会话再拉
+一遍，形成快速重启循环。
+
+这是 XFCE 的单实例设计与「同一用户多个桌面」需求之间的固有矛盾，不是本模块引入的
+缺陷：nixpkgs 的 `xrdp` 模块对 D-Bus 没有任何处理（`startwm.sh` 只有
+`. /etc/profile; $WM`），同用户的第二个 XFCE 会话同样会这样死。
+
+### 受影响场景
+
+- 同一用户同时（或先后）跑着 xrdp / 显示管理器的 XFCE 桌面。
+- **「我以为已经停掉了」的孤儿会话。** `systemctl stop xrdp xrdp-sesman` 只停单元；
+  xrdp 的桌面进程早已被 `pam_systemd` 迁进 logind session scope
+  （`user.slice/user-<uid>.slice/session-<id>.scope`），不在单元的 cgroup 里，停单元杀不
+  到它们。`xfce4-session` 于是成为孤儿，继续持有 `org.xfce.SessionManager`，logind 会话
+  也仍然是 active（leader 已退出 → `active (abandoned)`），kasmvnc 照旧秒退循环。
+
+### 解法
+
+给每个桌面一条**自己的**会话总线，即在 `windowManager` 前加 `dbus-run-session`：
+
+```nix
+services.kasmvnc.windowManager = "dbus-run-session xfce4-session";
+```
+
+`dbus-run-session` 为这条命令新起一条 session bus（并覆盖 `DBUS_SESSION_BUS_ADDRESS`），
+`xfce4-session` 在私有总线上的单实例名字不再与别人冲突，桌面正常常驻，xrdp 与 kasmvnc
+互不干扰。这也是上游生态里的通行解法。需要注意的几点：
+
+- **登录环境不受影响。** wrapper 仍然 source `/etc/profile`，`XDG_DATA_DIRS` /
+  `XDG_CONFIG_DIRS` / `NIX_PROFILES` / `$XDG_RUNTIME_DIR` 照旧；`dbus-run-session` 只替换
+  `DBUS_SESSION_BUS_ADDRESS`（wrapper 里的 `systemctl --user import-environment` 走的是
+  logind 的 user manager，也不受影响）。
+- **输入法不受影响。** fcitx5 的 GTK/Qt immodule 通过 `NIX_PROFILES` 里的 immodules 缓存
+  与 `GTK_IM_MODULE`/`QT_IM_MODULE`/`XMODIFIERS` 生效，输入法进程本身通过自己的 socket
+  被客户端发现，不依赖会话总线上的名字（见「输入法」）。
+- **跨桌面共享的 user 服务会分叉。** 只在 user bus 上暴露名字的东西（通知守护、只装了
+  user unit 的服务）此后每个桌面各有一份；需要全局唯一时请改用系统级服务。
+
+### 排错
+
+按顺序确认是「名字被占」而不是别的启动失败：
+
+```bash
+# 1. 是不是「成功退出」的循环：0 = 会话自己 exit 0，不是崩溃
+systemctl show kasmvnc-session -p ExecMainStatus -p NRestarts
+journalctl -u kasmvnc-session --no-pager -n 50   # 每 ~2s 一条 Deactivated successfully.
+
+# 2. 名字在谁手里；顺便看 ICE socket 残留
+busctl --user list | grep -i xfce.session        # org.xfce.SessionManager  <pid>  ...
+ls -l /tmp/.ICE-unix/                            # 每轮一个 pid 命名的 socket
+
+# 3. 占名者是谁：正常会话 / 孤儿 / 另一个桌面
+pgrep -a xfce4-session                           # 注意：xfce4-session 会把 comm 改成 .xfce4-session-
+loginctl list-sessions                           # 有没有残留会话（Service 可能是 xrdp-sesman / kasmvnc-session）
+```
+
+清理孤儿会话有个坑：对 leader 已退出的 abandoned 会话，`loginctl terminate-session <id>`
+是**空操作**（返回成功但什么都没杀，真机实测），必须
+
+```bash
+loginctl kill-session <id> --signal=SIGKILL
+# 或者直接 kill 掉 pgrep -a xfce4-session 里的那个进程
+```
+
+杀掉后 `kasmvnc-session` 的 `Restart=always` 下一轮就会自己恢复正常，不需要手动
+`systemctl restart`。对比：本模块的 `kasmvnc-session.service` 自带 `ExecStopPost` 会话
+清理（见「会话生命周期」），停止时不会留下这种孤儿；nixpkgs 的 `xrdp` 模块没有。
 
 ## 输入法
 
@@ -386,6 +483,9 @@ VM 测试：
   `NIX_PROFILES`/`XDG_*`/`GTK_PATH`/`LOCALE_ARCHIVE`/`LANG` 与 `su -` 逐字相等；还断言
   session `PATH` = wrapper 前置项 + 登录 `PATH`
 - `checks.<sys>.kasmvnc-xfce`：XDG 会话环境（xfconfd、failsafe 会话、面板）
+- `checks.<sys>.kasmvnc-multi-session`：多桌面并存时的 D-Bus 单实例冲突——第一个桌面
+  在 user bus 上持有 `org.xfce.SessionManager` 时，裸 `xfce4-session` 秒退 0，
+  `dbus-run-session` 包裹的同一命令持续存活，且第一个桌面不受影响
 - `checks.<sys>.kasmvnc-launcher`：会话 `PATH` 含用户 profile（用 PyGObject 调
   `Gio.DesktopAppInfo` 验证 GLib 能加载 `Exec=` 为裸命令名、程序只在用户 profile 里的
   `.desktop` 文件）

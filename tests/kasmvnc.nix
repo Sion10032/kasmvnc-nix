@@ -75,6 +75,19 @@ let
       environment.systemPackages = [ config.i18n.inputMethod.package ];
     };
 
+  # Node for the multi-desktop regression test: the XFCE desktop of `xfceNode`,
+  # but started *without* the `dbus-run-session` prefix, i.e. `xfce4-session`
+  # runs on the user bus of the PAM session and claims `org.xfce.SessionManager`
+  # there - exactly the situation a second graphical session of the same user
+  # (an xrdp / display-manager desktop) produces.
+  multiSessionNode =
+    { lib, ... }:
+    {
+      imports = [ xfceNode ];
+
+      services.kasmvnc.windowManager = lib.mkForce "xfce4-session";
+    };
+
   # Node for the launcher regression test: the XFCE desktop of `xfceNode` plus
   # PyGObject, so that the test can ask GLib itself whether it accepts a
   # `.desktop` file (`Gio.DesktopAppInfo`). The application the test installs is
@@ -457,6 +470,140 @@ in
       session_env = "/proc/$(pgrep -f '^xfce4-session$' | head -n1)/environ"
       machine.succeed(f"grep -zq '^XDG_DATA_DIRS=.*/run/current-system/sw/share$' {session_env}")
       machine.succeed(f"grep -zq '^XDG_CONFIG_DIRS=.*/run/current-system/sw/etc/xdg$' {session_env}")
+    '';
+  };
+
+  # Regression test for *multi-desktop single-instance conflicts*.
+  #
+  # `kasmvnc-session.service` runs its desktop in a PAM session, which means the
+  # desktop talks to the user's D-Bus session bus (`unix:path=/run/user/<uid>/bus`).
+  # That bus is per *user*, not per desktop: a second graphical session of the
+  # same user (xrdp in the reported case) shares it. `xfce4-session` is a
+  # single-instance service and claims `org.xfce.SessionManager` on the bus, so
+  # the second instance initialises (ICE socket, clients) and then exits - with
+  # status 0 and without any diagnostic - which under `Restart=always` turns into
+  # an endless restart loop (`Deactivated successfully.` every 2s).
+  #
+  # The test reproduces the conflict with the first kasmvnc desktop as the name
+  # holder: while its `xfce4-session` owns `org.xfce.SessionManager` on the user
+  # bus, a second desktop command is started through the session unit's own
+  # wrapper, as the session user, on the session display and with the session's
+  # `$XDG_RUNTIME_DIR` (i.e. on the same user bus).
+  #
+  # 1. Unwrapped (`xfce4-session`) it has to exit on its own, with status 0 -
+  #    that is the silent quick exit the bug report showed in the journal.
+  # 2. Wrapped (`dbus-run-session xfce4-session`, the documented workaround) it
+  #    has to stay alive until the `timeout` kills it (status 124), because it
+  #    then owns the name on a private session bus instead of the shared user
+  #    bus.
+  # 3. The first desktop has to be unaffected: same main process, same unit
+  #    state, no restart.
+  #
+  # The name holder is identified through `busctl --user list` (the PID column)
+  # instead of `pgrep`: the desktop here runs as the *resolved* absolute path and
+  # `xfce4-session` also renames its process to `.xfce4-session-`, so neither
+  # `pgrep -f '^xfce4-session$'` nor `pgrep -x xfce4-session` matches it.
+  kasmvnc-multi-session = pkgs.testers.runNixOSTest {
+    name = "kasmvnc-multi-session";
+
+    nodes.machine = multiSessionNode;
+
+    testScript = ''
+      start_all()
+
+      machine.wait_for_unit("kasmvnc.service", timeout=300)
+      machine.wait_for_unit("kasmvnc-session.service", timeout=300)
+
+      uid = machine.succeed("id -u kasm-user").strip()
+      runtime_dir = f"/run/user/{uid}"
+
+      def session_main_pid():
+          return machine.succeed(
+              "systemctl show -p MainPID --value kasmvnc-session.service"
+          ).strip()
+
+      def name_owner():
+          """PID owning `org.xfce.SessionManager` on the *user* bus (empty when
+          nobody owns it). `busctl --user` finds the bus through
+          `$XDG_RUNTIME_DIR`; the PID is the second column of `busctl list`."""
+          return machine.succeed(
+              f"runuser -u kasm-user -- env XDG_RUNTIME_DIR={runtime_dir} "
+              "busctl --user list --no-legend "
+              "| awk '$1 == \"org.xfce.SessionManager\" { print $2 }'"
+          ).strip()
+
+      def wait_for_name_owner(pid):
+          for _ in range(120):
+              if name_owner() == pid:
+                  return
+              machine.sleep(1)
+          raise AssertionError(
+              f"org.xfce.SessionManager is owned by {name_owner()!r}, "
+              f"not by the session unit's main process {pid!r}"
+          )
+
+      session_pid = session_main_pid()
+      # Precondition: the first desktop's own session manager holds the
+      # single-instance name on the user bus the kasmvnc session runs on. This
+      # is what a second desktop of the same user (an xrdp session, or what is
+      # left of one) collides with.
+      wait_for_name_owner(session_pid)
+
+      # The session unit's own entry point: this is what `ExecStart=` runs, so
+      # the second desktop is started exactly the way the unit starts one (the
+      # `/etc/profile` sourcing, `$PATH` resolution and user bus export are all
+      # part of it). `systemctl show` prints `{ path=<wrapper> ; argv[]=... }`.
+      exec_start = machine.succeed(
+          "systemctl show -p ExecStart --value kasmvnc-session.service"
+      )
+      wrapper = exec_start.split("path=")[1].split(" ")[0].rstrip(";")
+      assert wrapper.startswith("/nix/store/"), exec_start
+
+      def run_desktop(name, command, timeout=15):
+          """Start a desktop command like the session unit does and return its
+          exit status (124 = still alive when `timeout` killed it) plus its
+          output. The `if` keeps the driver's `set -e` from swallowing the
+          status."""
+          log = f"/tmp/kasmvnc-multi-session-{name}.log"
+          status = machine.succeed(
+              f"if runuser -u kasm-user -- env -i HOME=/home/kasm-user DISPLAY=:1 "
+              f"XDG_RUNTIME_DIR={runtime_dir} "
+              f"${pkgs.coreutils}/bin/timeout {timeout} {wrapper} {command} "
+              f"> {log} 2>&1; then echo 0; else echo $?; fi"
+          )
+          return int(status.strip().splitlines()[-1]), machine.succeed(
+              f"cat {log} || true"
+          ).strip()
+
+      # 1. The conflict: the plain desktop command dies on its own, successfully
+      #    and silently, because the name is taken on the user bus. A desktop
+      #    that stayed up (124) would mean the conflict was not reproduced here.
+      rc, log = run_desktop("plain", "xfce4-session")
+      assert rc == 0, (
+          "a second, unwrapped xfce4-session on the shared user bus did not exit "
+          f"with status 0 as reported (rc={rc}, output={log!r})"
+      )
+
+      # 2. The workaround: a private session bus per desktop removes the
+      #    conflict, so the same command keeps running (124 = killed by
+      #    `timeout`, i.e. it was still alive after 15s).
+      rc, log = run_desktop("dbus-run-session", "dbus-run-session xfce4-session")
+      assert rc == 124, (
+          "`dbus-run-session xfce4-session` did not stay alive for the whole "
+          f"timeout (rc={rc}, output={log!r})"
+      )
+
+      # 3. No regression for the running desktop: it was never part of the
+      #    experiment, so its main process is the same one (this also rules out
+      #    a `Restart=always` of the unit in between) and the client of its
+      #    failsafe session is still there.
+      assert session_main_pid() == session_pid, (
+          "the running desktop was restarted by the experiment"
+      )
+      machine.succeed(f"kill -0 {session_pid}")
+      machine.succeed("systemctl is-active kasmvnc-session.service")
+      machine.succeed("pgrep -f '[x]fwm4' >/dev/null")
+      wait_for_name_owner(session_pid)
     '';
   };
 
