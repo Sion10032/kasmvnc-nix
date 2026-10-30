@@ -1,3 +1,5 @@
+# Patch against the GPLv2 KasmVNC sources; released under MIT, which is
+# GPLv2-compatible and may be merged upstream freely.
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
 @@ -3,9 +3,6 @@
