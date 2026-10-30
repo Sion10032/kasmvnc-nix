@@ -36,79 +36,6 @@ let
   resolutionWidth = lib.toInt (lib.elemAt resolution 0);
   resolutionHeight = lib.toInt (lib.elemAt resolution 1);
 
-  # Rebuild a search-path-like session variable the same way NixOS does for a
-  # login session (`/etc/set-environment`): the explicitly configured
-  # `environment.sessionVariables.<name>` (a string or a list) followed by
-  # `environment.profileRelativeSessionVariables.<name>` expanded over every
-  # entry of `environment.profiles`. A system that customises its session
-  # environment is thereby inherited instead of overridden; `fallback` is only
-  # used when nothing at all is defined.
-  #
-  # `environment.profiles` mixes in PAM/shell-expandable entries such as
-  # `$HOME/.nix-profile` or `${XDG_STATE_HOME}/nix/profile`. systemd does not
-  # expand variables in `Environment=`, so `$HOME`/`$USER` are substituted for
-  # the session user and entries using any other variable are dropped.
-  sessionSearchPath =
-    name: fallback:
-    let
-      expand =
-        entry:
-        let
-          substituted =
-            lib.replaceStrings [ "$HOME" "\${HOME}" "$USER" "\${USER}" ] [ userHome userHome cfg.user cfg.user ]
-              entry;
-        in
-        lib.optional (!lib.hasInfix "$" substituted) substituted;
-
-      entries = map toString (
-        lib.toList (config.environment.sessionVariables.${name} or [ ])
-        ++ lib.concatMap (
-          profile:
-          map (suffix: profile + suffix) (config.environment.profileRelativeSessionVariables.${name} or [ ])
-        ) config.environment.profiles
-      );
-      value = lib.concatStringsSep ":" (lib.concatMap expand entries);
-    in
-    if value == "" then fallback else value;
-
-  # A login shell expands variables inside `NIX_PROFILES` (`$HOME`, `$USER`,
-  # `${XDG_STATE_HOME}`, ...); systemd's `Environment=` expands nothing at all,
-  # so the expansion is reproduced here: `HOME`/`USER` become the session user's
-  # values and every other variable expands to the empty string - which is what
-  # a shell does with an unset variable (`${XDG_STATE_HOME}/nix/profile` turns
-  # into `/nix/profile`, exactly as in `/etc/set-environment`).
-  expandSessionVariables =
-    value:
-    let
-      known = {
-        HOME = userHome;
-        USER = cfg.user;
-      };
-      # `builtins.split` returns the plain text interleaved with the capture
-      # group lists, one entry for every `$NAME` / `${NAME}` reference found:
-      # [ "before" [ "NAME" null ] "between" [ null "NAME" ] "after" ].
-      pieces = builtins.split "[$][{]([A-Za-z_][A-Za-z0-9_]*)[}]|[$]([A-Za-z_][A-Za-z0-9_]*)" value;
-      render =
-        piece:
-        if builtins.isString piece then
-          piece
-        else
-          let
-            name = if builtins.elemAt piece 0 != null then builtins.elemAt piece 0 else builtins.elemAt piece 1;
-          in
-          known.${name} or "";
-    in
-    lib.concatMapStrings render pieces;
-
-  # `NIX_PROFILES` is the *space* separated list of `environment.profiles` that
-  # `/etc/set-environment` exports for a login session, in the reverse of the
-  # order used for `PATH` (`environment.extraInit`, see
-  # `nixos/modules/programs/environment.nix`), i.e.
-  #   /run/current-system/sw /nix/var/nix/profiles/default ...
-  nixProfiles = lib.concatStringsSep " " (
-    map expandSessionVariables (lib.reverseList (map toString config.environment.profiles))
-  );
-
   # `NIX_PROFILES` only makes the input-method *modules* discoverable; an
   # application still has to bridge to them. GTK and Qt do that by themselves
   # (GTK picks the best locale match from the immodules cache, see
@@ -116,8 +43,16 @@ let
   # Code, ...) and plain Qt applications only enable their IME bridge when
   # `GTK_IM_MODULE` / `QT_IM_MODULE` is set, and XIM clients need
   # `XMODIFIERS`. A login session gets these from `environment.variables` (that
-  # is where `i18n.inputMethod` writes them), which a system service never sees
-  # either.
+  # is where `i18n.inputMethod` writes them).
+  #
+  # `NIX_PROFILES` itself is *not* injected any more: the session wrapper sources
+  # `/etc/profile`, which exports it with `$HOME`/`$USER` expanded by a shell (see
+  # `sessionWrapper`). These three are the exception, because `pam_env` writes
+  # them with `DEFAULT=` semantics for a login session only when
+  # `environment.variables` defines them, and `waylandFrontend = true` makes
+  # `i18n.inputMethod` leave them out. They are set on the unit, and `pam_env`'s
+  # `DEFAULT=` never overwrites an already set variable, so the inherited value
+  # is simply confirmed and the fcitx5 fallback survives.
   #
   # Inheritance first: whatever the system defines for a login session is used
   # verbatim, so the two environments agree. When the system asks for fcitx5 but
@@ -159,63 +94,32 @@ let
       "XMODIFIERS"
     ]) inject;
 
-  # Both units run parts of the same *user session*, so they share environment
-  # and `PATH`. The session unit runs a *desktop session* (window manager,
-  # desktop environment helpers), not just module-owned binaries, but as a system
-  # service it starts without the environment a login session gets from
-  # `/etc/set-environment`.
-  #
-  # Desktop environments rely on the XDG base directory variables:
-  # `XDG_DATA_DIRS` is how the session bus finds D-Bus activation files
-  # (`share/dbus-1/services/org.xfce.Xfconf.service` -> xfconfd) and
-  # `XDG_CONFIG_DIRS` is where their default configuration lives
-  # (`etc/xdg/xfce4/xfconf/xfce-perchannel-xml/`). Without them an XFCE
-  # session comes up with no window manager, or aborts with "unable to
-  # determine failsafe session name. xfconfd isn't running."
-  # The values are inherited from the system session environment and only
-  # defaulted, so `systemd.services.<name>.environment.*` still wins.
+  # The X server unit runs no user session (the desktop lives in
+  # `kasmvnc-session.service`, which gets its environment from the PAM session),
+  # so `HOME` - `~/.vnc` for `preStart` and `vncserver` - is all it needs.
   sessionEnvironment = {
     HOME = userHome;
-    # A system service has no login shell, so `/etc/profile` never runs for it
-    # and `NIX_PROFILES` is missing from its environment. GTK's NixOS patch
-    # (`pkgs/by-name/gt/gtk3/patches/3.0-immodules.cache.patch`) discovers the
-    # immodules cache by looking for `<profile>/etc/gtk-3.0/immodules.cache` in
-    # every entry of `NIX_PROFILES`; without the variable GTK only knows
-    # `gtk-im-context-simple` and ignores every input-method module (fcitx5,
-    # ibus, ...) that `i18n.inputMethod` installed into the system profile. The
-    # result is that input methods are dead inside the desktop session even
-    # though the system is configured correctly. The value is the same one
-    # `/etc/profile` exports, with the session user substituted; `mkDefault`, so
-    # `systemd.services.<name>.environment.NIX_PROFILES` still wins.
-    NIX_PROFILES = lib.mkDefault nixProfiles;
-    XDG_DATA_DIRS = lib.mkDefault (sessionSearchPath "XDG_DATA_DIRS" "/run/current-system/sw/share");
-    XDG_CONFIG_DIRS = lib.mkDefault (
-      sessionSearchPath "XDG_CONFIG_DIRS" "/etc/xdg:/run/current-system/sw/etc/xdg"
-    );
-  }
-  # `GTK_IM_MODULE`, `QT_IM_MODULE` and `XMODIFIERS`: see
-  # `sessionInputMethodEnvironment`.
-  // sessionInputMethodEnvironment;
+  };
 
-  # Setting `path` on a unit *replaces* its whole PATH, it does not append to it,
-  # hence the system profile is listed explicitly, last, so the module's own
-  # packages keep precedence. This is what makes a bare command name such as
-  # `xfce4-session` (installed via `environment.systemPackages` / a desktop
-  # module) resolvable. Every entry gets `/bin` appended, so the entry is the
-  # profile root and the resulting PATH element is `/run/current-system/sw/bin`.
-  # `dbus` provides `dbus-run-session` for desktop environments that need a
-  # session bus.
+  # The desktop session's own `PATH` entries, prepended by `sessionWrapper` to
+  # the login `PATH`: the user profiles (they are part of the login `PATH`
+  # already, but not in front of the system profile) and the module's own
+  # package (`kasmvncpasswd`, ...).
+  wrapperPath = [
+    "${userHome}/.nix-profile/bin"
+    "/etc/profiles/per-user/${cfg.user}/bin"
+    "${cfg.package}/bin"
+  ];
+
+  # `kasmvnc.service` needs the module's own packages (`vncserver`,
+  # `kasmvncpasswd`, `openssl`) and is the `PATH` that `Xvnc` exports to the X
+  # session (`~/.vnc/xstartup`); the desktop session's `PATH` comes from the
+  # login environment instead (see `wrapperPath` and `sessionWrapper`).
   #
-  # A login session's `PATH` is built from `environment.profiles` and therefore
-  # also contains the *user* profiles (that is where `nix profile install` and
-  # home-manager put their packages). Those are appended at the end, so they do
-  # not take precedence over the module's own packages, but they have to be
-  # there: GLib's `GDesktopAppInfo` validates a `.desktop` file's `Exec[0]` (and
-  # `TryExec`) with `g_find_program_for_path()` against `PATH` and drops the
-  # application from every launcher when the bare command name is not found
-  # (`gio/gdesktopappinfo.c`, `g_desktop_app_info_load_keyfile`). Without them
-  # exactly those applications disappear from panels/appfinders that install
-  # with a bare `Exec=`, while the ones with an absolute store path still show.
+  # Setting `path` on a unit *replaces* its whole PATH, it does not append to it,
+  # hence the system profile is listed explicitly. Every entry gets `/bin`
+  # appended, so the entry is the profile root and the resulting PATH element is
+  # `/run/current-system/sw/bin`.
   sessionPath = [
     cfg.package
     pkgs.coreutils
@@ -234,10 +138,115 @@ let
     "${userHome}/.nix-profile"
   ];
 
-  # `ExecSearchPath=` is how systemd resolves a *bare* `ExecStart=` command
-  # name: the unit's `PATH` environment is only what the spawned processes see,
-  # it is not consulted by systemd itself. Same directories as `sessionPath`.
-  sessionSearchDirs = lib.concatStringsSep ":" (map (p: "${toString p}/bin") sessionPath);
+  # `pam_systemd` does not just *tell* the processes about a session, it
+  # registers them as one: it moves them out of the unit's cgroup into
+  # `user.slice/user-<uid>.slice/session-<id>.scope`. That is what makes the
+  # desktop a real user session (`$XDG_RUNTIME_DIR`, user manager, user bus), but
+  # it also means the unit's own `KillMode=` cannot reach them. A session whose
+  # leader process exited while other clients are still running is left
+  # `active (abandoned)` by logind - the old desktop (panel, window manager,
+  # settings daemon, ...) keeps running, and `Restart=always` would stack a second
+  # desktop on top of it. Terminating the session is what a display manager does
+  # on logout, so this unit does the same when it stops - which includes the stop
+  # that precedes a restart.
+  sessionCleanup = pkgs.writeShellScript "kasmvnc-session-cleanup" ''
+    # Runs as root (`ExecStopPost=+...`): killing another user's session goes
+    # through polkit otherwise.
+    loginctl=/run/current-system/systemd/bin/loginctl
+
+    "$loginctl" list-sessions --no-legend 2>/dev/null |
+      while read -r session _uid user _rest; do
+        [ "$user" = ${lib.escapeShellArg cfg.user} ] || continue
+        # `PAMName=` applies to *every* command of the unit, so this script itself
+        # runs in a session of `kasmvnc-session`; never kill that one.
+        [ "$session" = "''${XDG_SESSION_ID:-}" ] && continue
+        [ "$("$loginctl" show-session "$session" -p Service --value 2>/dev/null)" = "kasmvnc-session" ] || continue
+        # The desktop's processes live in the session's scope instead of the
+        # unit's cgroup, and logind leaves a session whose leader exited
+        # `active (abandoned)` instead of terminating it - `terminate-session`
+        # alone is a no-op on such a session, killing it is not.
+        "$loginctl" kill-session "$session" || true
+        ${pkgs.coreutils}/bin/sleep 0.5
+        "$loginctl" kill-session "$session" --signal=SIGKILL || true
+        "$loginctl" terminate-session "$session" || true
+      done
+  '';
+
+  # The desktop session is started the way a graphical login starts one - in two
+  # layers, instead of reproducing the login environment declaratively:
+  #
+  # 1. `PAMName=` (on `kasmvnc-session.service`) opens a PAM session with
+  #    `/etc/pam.d/kasmvnc-session`, which has the same generic stack
+  #    `xrdp-sesman` or `systemd --user` get: `pam_env` (layer 1 - `PATH` with
+  #    `/run/wrappers/bin`, `XDG_*`, `GTK_PATH`, `LOCALE_ARCHIVE`, ... from
+  #    `/etc/pam/environment`) and `pam_systemd` (a logind session, i.e.
+  #    `$XDG_RUNTIME_DIR`, the user manager and the user bus).
+  # 2. This wrapper sources `/etc/profile` (layer 2 - `NIX_PROFILES` and every
+  #    `environment.variables` entry, with `$HOME`/`$USER` expanded by a *real*
+  #    shell), prepends the paths the module needs, aligns the user manager and
+  #    the D-Bus activation environment with the session, and execs the desktop.
+  #    That is what nixpkgs' `xsession-wrapper`
+  #    (`nixos/modules/services/x11/display-managers/default.nix`) does for a
+  #    display manager session.
+  sessionWrapper = pkgs.writeShellScript "kasmvnc-session-wrapper" ''
+    # Layer 2: the login shell environment. `/etc/profile` is *sourced*, exactly
+    # like a login shell does it, so its `return` ("only execute once") is fine.
+    # This *replaces* the `PATH` that `pam_env` provided.
+    . /etc/profile
+
+    # Prepend what the module guarantees: the user profiles (they are part of the
+    # login `PATH`, but this keeps them in front of the system profile) and the
+    # module's own package.
+    export PATH=${lib.escapeShellArg (lib.concatStringsSep ":" wrapperPath)}:"$PATH"
+
+    # A `SESSION_MANAGER` inherited from another session would make the desktop's
+    # clients join the wrong X session manager (`~/.vnc/xstartup` used to unset
+    # it).
+    unset SESSION_MANAGER
+
+    # `pam_systemd` starts `user@<uid>.service` asynchronously, so the user bus
+    # socket can appear a moment after the session does. Wait for it (30s), but
+    # never fail the session over it: without a bus the desktop still has to come
+    # up.
+    bus=""
+    if [ -n "''${XDG_RUNTIME_DIR:-}" ]; then
+      bus="$XDG_RUNTIME_DIR/bus"
+      tries=0
+      while [ ! -S "$bus" ] && [ "$tries" -lt 150 ]; do
+        ${pkgs.coreutils}/bin/sleep 0.2
+        tries=$((tries + 1))
+      done
+    fi
+
+    if [ -n "$bus" ] && [ -S "$bus" ]; then
+      # The user bus of this PAM session: what the desktop of a login session
+      # talks to as well.
+      export DBUS_SESSION_BUS_ADDRESS="unix:path=$bus"
+
+      # Make the user manager and the D-Bus activation environment agree with the
+      # session about the display and its `PATH` (`xsession-wrapper` does the
+      # same). The variable list is the default of
+      # `services.xserver.displayManager.importedVariables`
+      # (`nixos/modules/services/x11/display-managers/default.nix`), plus `PATH`
+      # so that user units start with the login `PATH`.
+      /run/current-system/systemd/bin/systemctl --user import-environment \
+        DBUS_SESSION_BUS_ADDRESS DISPLAY PATH XAUTHORITY XDG_SESSION_ID || true
+      ${lib.getBin pkgs.dbus}/bin/dbus-update-activation-environment --systemd --all || true
+    else
+      echo "kasmvnc-session: no user D-Bus session bus (XDG_RUNTIME_DIR=''${XDG_RUNTIME_DIR:-}), starting the desktop without one" >&2
+    fi
+
+    # Resolve the desktop command through the login `PATH`, so a bare name
+    # behaves like in a login shell (`windowManager` is split on whitespace, so
+    # only the first word is looked up).
+    command_name="$1"
+    shift
+    if ! command_path="$(command -v "$command_name")"; then
+      echo "kasmvnc-session: cannot find '$command_name' in PATH=$PATH" >&2
+      exit 127
+    fi
+    exec "$command_path" "$@"
+  '';
 
   # `kasmvnc.service` is `Type=forking`, i.e. it is considered started as soon as
   # Xvnc has been forked, not when the server actually listens. The window
@@ -420,10 +429,9 @@ in
     windowManager = mkOption {
       type = types.nullOr types.str;
       default = null;
-      example = "dbus-run-session xfce4-session";
+      example = "xfce4-session";
       description = ''
-        Command the desktop session runs, i.e. the `ExecStart=` of
-        `kasmvnc-session.service`, e.g.
+        Command the desktop session runs, e.g.
         `"''${pkgs.icewm}/bin/icewm-session"`.
 
         The session is supervised: if the window manager exits (a crash, or the
@@ -433,29 +441,28 @@ in
         stopped together with `kasmvnc.service`, so
         `systemctl stop kasmvnc` is the way to shut the session down for good.
 
-        This is a plain systemd `ExecStart=`, not a shell command line: it is
-        split on whitespace, so shell syntax (pipes, redirections, `&&`, `exec`)
-        does not work. Use a wrapper script if you need that.
+        The command line is split on whitespace and its words are handed to the
+        session wrapper, so shell syntax (pipes, redirections, `&&`, `exec`) does
+        not work. Use a wrapper script if you need that.
 
-        A bare command name is looked up in `ExecSearchPath=`, which the module
-        fills with the same directories as the units' `PATH`: the packages this
-        module needs plus `/run/current-system/sw/bin`. Setting `path` on a unit
-        *replaces* its `PATH`, so the system profile is added explicitly; a bare
-        name therefore only resolves for programs that are installed through the
-        system profile (e.g.
+        The session is started like a **login session** (see the README): it runs
+        in a PAM session (`pam_env` + `pam_systemd`, i.e. logind session,
+        `$XDG_RUNTIME_DIR` and the user D-Bus bus are there before the desktop
+        starts) and the wrapper sources `/etc/profile` first. A bare command name
+        therefore resolves through the login `PATH`, exactly as in a login shell:
+        the user profiles, `/run/current-system/sw/bin` (i.e. programs installed
+        through the system profile such as
         `services.xserver.desktopManager.xfce` or
-        `environment.systemPackages`). Everything else needs an absolute store
-        path such as `"''${pkgs.icewm}/bin/icewm-session"`.
+        `environment.systemPackages`) and the module's own package. Everything
+        else needs an absolute store path such as
+        `"''${pkgs.icewm}/bin/icewm-session"`.
 
-        Desktop environments (and window managers that use a session bus) need
-        a D-Bus session bus, so wrap them in `dbus-run-session` (`dbus` is on the
-        units' `PATH`), e.g. `"dbus-run-session xfce4-session"`.
-
-        They also need the XDG session environment to find their D-Bus
-        activation files and default configuration; the module provides
-        `XDG_DATA_DIRS` and `XDG_CONFIG_DIRS` for `kasmvnc-session.service` (and
-        `kasmvnc.service`), inherited from the system's session variables and
-        overridable through `systemd.services.kasmvnc-session.environment.*`.
+        Desktop environments (and window managers that use a session bus) get the
+        user's D-Bus session bus from the PAM session, so `dbus-run-session` is no
+        longer needed (it still works and simply starts another bus). They also
+        get the XDG session environment (`XDG_DATA_DIRS`, `XDG_CONFIG_DIRS`, ...)
+        from the login environment, which is what their D-Bus activation files and
+        default configuration are found through.
 
         When `null`, there is no `kasmvnc-session.service` at all: Xvnc runs with
         an empty desktop that only a VNC client can use.
@@ -533,6 +540,18 @@ in
 
     environment.etc."kasmvnc/kasmvnc.yaml".text = kasmvncYaml;
 
+    # The PAM service the desktop session is started with (`PAMName=`). An empty
+    # definition gets the generic NixOS stack - the same one
+    # `/etc/pam.d/xrdp-sesman` and `/etc/pam.d/systemd-user` build on - i.e.
+    # `pam_env` (session variables from `/etc/pam/environment`), `pam_unix`,
+    # `pam_limits`, `pam_loginuid` and `pam_systemd`. `startSession` is what
+    # pulls in `pam_systemd` (`systemd` special-cases it to provide
+    # `$XDG_RUNTIME_DIR` and to register the logind session; both `xrdp-sesman`
+    # and `systemd-user` set it), so this is not literally an empty attrset.
+    security.pam.services.kasmvnc-session = {
+      startSession = true;
+    };
+
     networking.firewall.allowedTCPPorts =
       optional cfg.openFirewall cfg.websocketPort ++ optional cfg.openFirewall vncPort;
 
@@ -541,13 +560,14 @@ in
       wantedBy = [ "multi-user.target" ];
       after = [ "network.target" ];
 
-      # See `sessionEnvironment`: XDG base directories for the X session's
-      # clients, HOME for the user's ~/.vnc.
+      # See `sessionEnvironment`: `HOME` for the user's `~/.vnc`. The desktop
+      # session gets the rest of its environment from a PAM session; the X
+      # server itself needs none of it.
       environment = sessionEnvironment;
 
       # The X server itself only needs the module's own packages, but the X
-      # session inherits this PATH (Xvnc exports it to `~/.vnc/xstartup`), so it
-      # is the same `PATH` the session unit gets: see `sessionPath`.
+      # session inherits this PATH (Xvnc exports it to `~/.vnc/xstartup`): see
+      # `sessionPath`.
       path = sessionPath;
 
       serviceConfig = {
@@ -615,33 +635,46 @@ in
       after = [ "kasmvnc.service" ];
       partOf = [ "kasmvnc.service" ];
 
-      environment = sessionEnvironment // {
-        # `vncserver` sets this for the X session; this unit has to be told
-        # explicitly which display to connect to.
-        DISPLAY = cfg.display;
-      };
+      # A PAM session, exactly like a graphical login: `pam_env` provides the
+      # system-wide session variables and `pam_systemd` registers the logind
+      # session (which creates `$XDG_RUNTIME_DIR` and starts the user manager
+      # with the user bus). systemd only calls `pam_open_session` here - it never
+      # authenticates the service (that is how `user@.service` uses `PAMName=`
+      # too), so the `auth` rules of the stack are not exercised; `User=` is what
+      # `PAMName=` requires.
+      #
+      # `environment` below is not dropped by that: systemd merges the PAM
+      # environment in, and `pam_env`'s `DEFAULT=` entries do not override
+      # variables that are already set.
 
-      path = sessionPath;
+      environment =
+        sessionEnvironment
+        // {
+          # `vncserver` sets this for the X session; this unit has to be told
+          # explicitly which display to connect to.
+          DISPLAY = cfg.display;
+        }
+        # `GTK_IM_MODULE`, `QT_IM_MODULE`, `XMODIFIERS`; see
+        # `sessionInputMethodEnvironment`.
+        // sessionInputMethodEnvironment;
 
       serviceConfig = {
         Type = "simple";
         User = cfg.user;
+        # See above: the PAM session is what provides the login environment.
+        PAMName = "kasmvnc-session";
         WorkingDirectory = userHome;
         # `kasmvnc.service` is `Type=forking`: being ordered after it does not
         # mean Xvnc is listening yet. Wait for the X socket, so the window
         # manager cannot race the server.
         ExecStartPre = "${waitForDisplay}";
-        # A plain systemd command line, resolved through `ExecSearchPath=`
-        # (i.e. the same directories as the unit's `PATH`).
-        ExecStart = cfg.windowManager;
-        ExecSearchPath = sessionSearchDirs;
-        # `~/.vnc/xstartup` used to unset these before exec'ing the window
-        # manager; a stale bus address or session manager would make the desktop
-        # clients talk to the wrong session.
-        UnsetEnvironment = [
-          "SESSION_MANAGER"
-          "DBUS_SESSION_BUS_ADDRESS"
-        ];
+        # The login-style wrapper (see `sessionWrapper`): it sources
+        # `/etc/profile`, aligns the user manager / session bus and execs the
+        # `windowManager` command line, whose words are passed as arguments.
+        # A bare command name is resolved through the *login* `PATH` there, so
+        # no `ExecSearchPath=` is involved (and it could not be: systemd only
+        # resolves the first word of an `ExecStart=`, which is the wrapper).
+        ExecStart = lib.escapeShellArgs ([ "${sessionWrapper}" ] ++ lib.splitString " " cfg.windowManager);
         # The session has to come back whenever it goes away, however it went
         # away: XFCE's "log out" makes `xfce4-session` terminate every client and
         # exit - successfully - and a crashing window manager may exit with any
@@ -655,10 +688,16 @@ in
         # `tests/kasmvnc.nix`).
         Restart = "always";
         RestartSec = 2;
-        # The window manager forks the session's clients (panel, settings
-        # daemon, ...); they all belong to this unit and must go away with it,
-        # otherwise a restart would stack a second desktop on the leftovers.
-        KillMode = "control-group";
+        # `pam_systemd` moved the desktop's processes into the logind session
+        # scope, so the unit's cgroup holds only the main process; `mixed` signals
+        # exactly that one (`control-group` would signal nothing, the cgroup is
+        # empty). The processes of the session are terminated by `ExecStopPost`,
+        # see `sessionCleanup`.
+        KillMode = "mixed";
+        # Runs as root (the `+`), see `sessionCleanup`: this is what keeps a
+        # restart from stacking a second desktop on the leftovers of the old
+        # logind session.
+        ExecStopPost = "+${sessionCleanup}";
         TimeoutStopSec = 30;
       }
       // lib.optionalAttrs (userGroup != "") {

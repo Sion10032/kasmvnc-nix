@@ -76,7 +76,7 @@ nix build github:<you>/kasmvnc-nix#kasmvnc
 | `frameRate` | int > 0 | `24` | 最大帧率 |
 | `vncUsername` | str | `"kasm_user"` | Web 登录用户名 |
 | `passwordFile` | path \| null | `null` | 明文口令文件，preStart 用 `kasmvncpasswd` 转换 |
-| `windowManager` | str \| null | `null` | 会话命令（`kasmvnc-session.service` 的 `ExecStart`）；裸名要求程序在系统 profile 中 |
+| `windowManager` | str \| null | `null` | 会话命令（交给登录语义 wrapper）；裸名按登录 `PATH` 解析 |
 | `interface` | str | `"0.0.0.0"` | 监听地址 |
 | `ssl.certFile` | path \| null | `null` | HTTPS 证书；`null` 时自动生成自签证书 |
 | `ssl.keyFile` | path \| null | `null` | HTTPS 私钥；必须与 `certFile` 同时设置 |
@@ -98,41 +98,34 @@ KasmVNC 必须有至少一条用户记录才能启动，因此 `passwordFile = n
 
 ### `windowManager`
 
-`windowManager` 是 `kasmvnc-session.service` 的 `ExecStart`：`kasmvnc.service` 只负责 X
-服务器，桌面会话由独立单元运行并被守护（见下面的「会话生命周期」）。四点需要注意：
+`windowManager` 是 `kasmvnc-session.service` 运行的桌面命令：`kasmvnc.service` 只负责 X
+服务器，桌面会话由独立单元运行并被守护（见下面的「会话生命周期」），而该单元运行在一个
+**登录语义的会话**里（见下面的「会话环境」）。四点需要注意：
 
-1. **裸命令名按单元的查找路径解析。** 这是 systemd 的 `ExecStart`，不是 shell 命令
-   行：按空白切分，不支持管道、重定向、`&&`、`exec` 等 shell 语法（需要时写包装脚本）。
-   裸名由 `ExecSearchPath=` 解析，模块把与单元 `PATH` 相同的目录填进去（模块自己的包 +
-   `/run/current-system/sw/bin`）。给单元设置 `path` 会**整体替换**它的 `PATH`，所以系统
-   profile 是显式加上的。这意味着裸名只有对**通过系统 profile 可达**的程序才有效，例如
-   `services.xserver.desktopManager.xfce` 或
-   `environment.systemPackages = [ pkgs.xfce.xfce4-session ]`。没有装到系统 profile
-   的程序必须写 store 路径。
-2. **桌面环境需要 D-Bus 会话总线。** `xfce4-session` 等在没有会话总线时会拒绝启动
-   （会话单元会 unset `DBUS_SESSION_BUS_ADDRESS`，对应原先 xstartup 的做法），因此要用
-   `dbus-run-session` 包裹；`dbus` 已在单元查找路径中，可以裸名调用。
-3. **桌面环境所需的 XDG 会话环境由模块注入。** 系统服务拿不到登录会话的环境
-   （`/etc/set-environment`），而桌面环境依赖它：`XDG_DATA_DIRS` 决定会话总线的
-   D-Bus activation 能否找到 `share/dbus-1/services/*.service`（例如
-   `org.xfce.Xfconf.service` → `xfconfd`），`XDG_CONFIG_DIRS` 决定默认配置从哪里读
-   （例如 `etc/xdg/xfce4/xfconf/xfce-perchannel-xml/`，`xfce4-session` 靠它得到
-   failsafe 会话定义）。模块为这两个变量提供默认值，**继承自系统的 session 变量**
-   （`environment.sessionVariables` 加上 `environment.profileRelativeSessionVariables`
-   对 `environment.profiles` 的展开，与登录会话的算法一致）；系统自定义过 session
-   环境时服务会一并跟上。需要覆盖时用
-   `systemd.services.kasmvnc-session.environment.XDG_DATA_DIRS` /
-   `.XDG_CONFIG_DIRS`（模块用的是 `mkDefault`）。
+1. **按空白切分，裸名按登录 `PATH` 解析。** 命令不是 shell 命令行：按空白切分，不支持
+   管道、重定向、`&&`、`exec` 等 shell 语法（需要时写包装脚本）。第一个词由 wrapper 在
+   登录 `PATH` 里解析（`command -v`），与登录 shell 的行为一致：用户 profile、
+   `/run/current-system/sw/bin`（即通过系统 profile 安装的程序，如
+   `services.xserver.desktopManager.xfce` 或 `environment.systemPackages`）以及本模块
+   自己的包都在其中。其余程序用 store 路径。
+2. **D-Bus 会话总线由 PAM 会话提供。** `pam_systemd` 注册 logind 会话时会启动 user
+   manager 和用户总线，wrapper 等它就绪并导出 `DBUS_SESSION_BUS_ADDRESS`，所以
+   `dbus-run-session` 不再是必需的（保留也可以，只是再起一条会话总线）。
+3. **XDG 会话环境来自 `/etc/profile`。** 桌面环境依赖 `XDG_DATA_DIRS`（决定会话总线的
+   D-Bus activation 能否找到 `share/dbus-1/services/*.service`，例如
+   `org.xfce.Xfconf.service` → `xfconfd`）与 `XDG_CONFIG_DIRS`（默认配置位置，例如
+   `etc/xdg/xfce4/xfconf/xfce-perchannel-xml/`，`xfce4-session` 靠它得到 failsafe 会话
+   定义）；wrapper 会 source `/etc/profile`，两者随之与登录会话完全一致，模块不再单独
+   声明。
 4. **`windowManager = null` 时没有会话服务。** Xvnc 会带着一个空桌面（占位的
    `~/.vnc/xstartup` 只 `exit 0`）运行，没有 `kasmvnc-session.service`。
 
 ```nix
-# 1) 裸名 + D-Bus 会话总线（程序需系统级安装，如 services.xserver.desktopManager.xfce）
-services.kasmvnc.windowManager = "dbus-run-session xfce4-session";
+# 1) 裸名（程序需在登录 PATH 中，如 services.xserver.desktopManager.xfce）
+services.kasmvnc.windowManager = "xfce4-session";
 
-# 2) store 路径：不依赖系统 profile；DE 仍需 dbus-run-session 包裹
-services.kasmvnc.windowManager =
-  "dbus-run-session ${pkgs.xfce.xfce4-session}/bin/xfce4-session";
+# 2) store 路径：不依赖系统/用户 profile
+services.kasmvnc.windowManager = "${pkgs.xfce.xfce4-session}/bin/xfce4-session";
 
 # 3) 不需要会话总线的窗口管理器，store 路径即可
 services.kasmvnc.windowManager = "${pkgs.icewm}/bin/icewm-session";
@@ -154,7 +147,7 @@ services.kasmvnc.windowManager = "${pkgs.icewm}/bin/icewm-session";
 | `echo "exit 0" > xstartup` | preStart 写入占位的 `~/.vnc/xstartup`（仅 `exit 0`） |
 | `icewm-session &` + 看门狗循环 | `kasmvnc-session.service`（`Restart=always` + `RestartSec=2`） |
 | `src/kasmvnc.yaml`（`/etc/kasmvnc/kasmvnc.yaml`） | 模块生成；额外内容用 `extraConfig` |
-| `tail -f` + 进程守护循环 | systemd（`Restart=on-failure` / `Restart=always`、`KillMode=control-group`） |
+| `tail -f` + 进程守护循环 | systemd（`Restart=on-failure` / `Restart=always`、会话终止） |
 
 ## 会话生命周期
 
@@ -180,37 +173,108 @@ X 服务器与桌面会话是**两个单元**：
   所以会话单元的 `ExecStartPre` 会循环等 `/tmp/.X11-unix/X<N>`（最长 60s），避免窗口管理器
   把 X 服务器“拉死”在启动阶段。
 - **`windowManager = null` 时没有会话单元。** Xvnc 只提供一个空桌面。
+- **停止时终止 logind 会话。** `pam_systemd` 会把桌面进程**移出单元 cgroup**，放到
+  `user.slice/user-<uid>.slice/session-<id>.scope`（这正是它们成为“真会话”的原因）。
+  因此单元的 `KillMode=` 拉不到它们，而且 logind 对「leader 已退出但客户端还在」的会话
+  只标为 `active (abandoned)`、不会主动清理——`Restart=always` 就会在旧桌面上再叠一个。
+  所以会话单元的 `ExecStopPost`（**同样也是「先停再启」的路径**）会以 root 身份
+  `loginctl kill-session`（必要时 SIGKILL）+ `terminate-session` 终止本服务的 logind
+  会话；`KillMode=mixed` 只负责给主进程（窗口管理器）发 SIGTERM。
+
+## 会话环境：登录语义
+
+`kasmvnc-session.service` 不是「systemd 服务 + 手写环境变量」，而是按**登录会话**的方式
+启动桌面。环境全部来自 NixOS 自己的机制，模块只做三件事：
+
+| 层 | 机制 | 提供什么 |
+|---|---|---|
+| 1 · PAM | `PAMName=kasmvnc-session` + `security.pam.services.kasmvnc-session`（`startSession = true`）| `pam_env`：`/etc/pam/environment` 的 session 变量（`PATH` 含 `/run/wrappers/bin`、`XDG_*`、`GTK_PATH`、`LOCALE_ARCHIVE`、`LANG`…）；`pam_unix`；`pam_limits`；`pam_loginuid`；`pam_systemd`：logind 会话 → `$XDG_RUNTIME_DIR` / user manager / user bus |
+| 2 · 登录 shell | wrapper 里 source `/etc/profile` | `/etc/set-environment` 的全量导出：`NIX_PROFILES`、全部 `environment.variables` / `environment.sessionVariables`、profile 派生的搜索路径（`PATH`/`GTK_PATH`/`XDG_DATA_DIRS`/`INFOPATH`…）；`$HOME`/`$USER` 由**真 shell** 展开 |
+| 3 · 对齐 | wrapper 里 `systemctl --user import-environment` + `dbus-update-activation-environment --systemd --all` | 让 user manager 与 D-Bus activation 环境与会话一致（D-Bus 激活的服务、后启动的 user unit 拿到正确的 `DISPLAY`/`PATH`/`DBUS_SESSION_BUS_ADDRESS`）|
+
+wrapper 额外做的三件事：
+
+- **前置 `PATH`**：`~/.nix-profile/bin`、`/etc/profiles/per-user/<user>/bin`、本模块的包
+  （登录 `PATH` 里本来就有用户 profile，这里只是保证它们在系统 profile 之前）。
+- **等 user bus**：轮询 `$XDG_RUNTIME_DIR/bus`（0.2s × 150 = 30s，`pam_systemd` 拉起
+  user manager 有竞态），就绪后导出
+  `DBUS_SESSION_BUS_ADDRESS=unix:path=$XDG_RUNTIME_DIR/bus`；超时只告警，会话照旧启动。
+- **清 `SESSION_MANAGER`**（来自其它会话的 X session manager 会把桌面客户端拉到错误
+  的会话上），然后 `exec` 桌面命令。
+
+与 xrdp / 显示管理器的对照：
+
+| 机制 | xrdp（`xrdp-sesman`）| 显示管理器（nixpkgs `xsession-wrapper`）| 本模块 |
+|---|---|---|---|
+| PAM 服务 | `xrdp-sesman`（`startSession = true`）| 各 DM 自己的服务（`gdm-launch-environment` 等）| `kasmvnc-session`（`startSession = true`）|
+| logind 会话 / user bus | `pam_systemd` | `pam_systemd` | `pam_systemd` |
+| 登录 shell 环境 | `startwm.sh` 里 `. /etc/profile` | wrapper 里 `. /etc/profile` | wrapper 里 `. /etc/profile` |
+| D-Bus 激活环境 | `dbus-update-activation-environment` | `systemctl --user import-environment <importedVariables>` | 两者都做 |
+| 会话总线 | `dbus-run-session` 或已有 user bus | 系统 user bus | 系统 user bus（PAM 会话提供）|
+| 会话守护 | `sesman` + `xrdp-sesman` | DM 自己 | `kasmvnc-session.service`（`Restart=always`）|
+| 会话清理 | `sesman` 注销时关闭 PAM 会话 | DM 注销时关闭 PAM 会话（+ kill） | `ExecStopPost` 里 `loginctl kill-session` + `terminate-session`（见「会话生命周期」）|
+
+验证方式（在运行中的系统上）：
+
+```bash
+# 会话存在，且是 kasmvnc-session 的 PAM 服务
+loginctl list-sessions
+loginctl show-session <id> -p Service --value   # kasmvnc-session
+loginctl show-session <id> -p Type --value      # unspecified（系统服务没有 tty/display）
+
+# 会话进程的 environ 与登录 shell 逐字一致
+pid=$(systemctl show -p MainPID --value kasmvnc-session)
+tr '\0' '\n' < /proc/$pid/environ | grep -E '^(NIX_PROFILES|DBUS_SESSION_BUS_ADDRESS|XDG_RUNTIME_DIR)='
+su - <user> -c 'printenv NIX_PROFILES'
+```
+
+### 从旧配置迁移
+
+旧版本（commit `41869e9` 及以前）用手写注入模拟登录环境。升级后下面这些应急配置可以
+删掉——它们与新的登录会话值冲突时只会造成困惑：
+
+| 删除 | 原因 |
+|---|---|
+| `environment.sessionVariables.NIX_PROFILES`（或 `environment.variables.NIX_PROFILES`）| `/etc/profile` 导出 |
+| `systemd.services.kasmvnc-session.environment.NIX_PROFILES` / `.XDG_DATA_DIRS` / `.XDG_CONFIG_DIRS` | 同上 |
+| `systemd.services.kasmvnc-session.path` 里的用户 profile（`/etc/profiles/per-user/<user>`、`~/.nix-profile`）| wrapper 前置追加 |
+| `GTK_IM_MODULE` / `QT_IM_MODULE` / `XMODIFIERS` 的手工设置 | 系统 `i18n.inputMethod` 已定义时由登录会话提供（`waylandFrontend = true` 时保留模块默认值）|
+| `windowManager` 外层的 `dbus-run-session` | PAM 会话已提供 user bus（保留也仍然能工作）|
+
+迁移后需要验证的四项：注销/重启后桌面回来、`loginctl list-sessions` 里有 `kasm-user`
+会话、rime 能输入、launcher（panel / whisker menu）里 home-manager 安装的应用仍在。
 
 ## 输入法
 
-输入法在会话里能用，需要**两层**机制，而 systemd 服务两层都拿不到（它们都只由登录会话
-的环境提供）：
+输入法在会话里能用，需要**两层**机制：
 
 1. **`NIX_PROFILES`：让 GTK 找得到 immodules。** nixpkgs 给 GTK3 打的补丁会遍历
    `NIX_PROFILES` 里的每个 profile，查找 `<profile>/etc/gtk-3.0/immodules.cache`
-   （即 `im-fcitx5.so` 等模块的清单）。该变量只由 `/etc/profile` 在登录 shell 里导出。
-   丢失它的后果是 GTK 只认 `gtk-im-context-simple`（哑输入上下文），系统里装好的输入法
-   在桌面会话内**完全失效**，而且没有任何报错。
+   （即 `im-fcitx5.so` 等模块的清单）。丢失它的后果是 GTK 只认 `gtk-im-context-simple`
+   （哑输入上下文），系统里装好的输入法在桌面会话内**完全失效**，而且没有任何报错。
+   该变量由 `/etc/profile` 导出，wrapper source 它，因此会话与登录 shell 逐字相同。
 2. **`GTK_IM_MODULE` / `QT_IM_MODULE` / `XMODIFIERS`：让应用真的启用 IME 桥。**
    GTK 与 Qt 自身会按 locale 从 immodules 缓存里自动选模块，但
    **Chromium / Electron 系应用（微信、VS Code、Discord 等）不查 GTK 的默认选择，而是
    显式读 `GTK_IM_MODULE` 决定是否接上输入法桥**；纯 Qt 应用同理看 `QT_IM_MODULE`；
-   XIM 客户端看 `XMODIFIERS`。只注入 `NIX_PROFILES` 时，probe 会报 `fcitx5`，但微信里
-   依然打不出字，原因就在这里。
+   XIM 客户端看 `XMODIFIERS`。
 
-`kasmvnc-session.service` 是 systemd 系统服务、没有登录 shell，所以模块为两个单元
-注入这些变量：
+`pam_env` 只会用 `DEFAULT=` 给这些变量提供**默认值**（已设置的变量不会被覆盖），而
+`waylandFrontend = true` 时 `i18n.inputMethod` 根本不会在登录环境里导出
+`GTK_IM_MODULE`/`QT_IM_MODULE`。所以这三件套依然由模块显式写在单元的 `Environment=`
+里：
 
-- **`NIX_PROFILES`**：取值与 `/etc/profile` 完全一致（`environment.profiles` 的逆序、
-  空格分隔，`$HOME` / `$USER` 替换为会话用户，未设置的变量按 shell 语义展开为空），
-  用 `mkDefault` 包裹。
-- **IM 三件套**：优先**继承** `environment.variables` 里系统已定义的值（`i18n.inputMethod`
-  就写在这里，因此会话环境与登录会话一致）；系统没有定义、但 `i18n.inputMethod.enable =
-  true` 且 `type = "fcitx5"` 时，用 `mkDefault` 注入 `GTK_IM_MODULE=fcitx`、
-  `QT_IM_MODULE=fcitx`、`XMODIFIERS=@im=fcitx`；其余情况不注入（模块不替用户选输入法
-  框架）。
+- 系统在 `environment.variables` 里定义过（`i18n.inputMethod` 就写在这里）时，继承同一个
+  值，与登录会话一致；
+- 系统没定义、但 `i18n.inputMethod.enable = true` 且 `type = "fcitx5"` 时（即
+  `waylandFrontend = true`），用 `mkDefault` 注入 `GTK_IM_MODULE=fcitx`、
+  `QT_IM_MODULE=fcitx`、`XMODIFIERS=@im=fcitx`；
+- 其余情况不注入（模块不替用户选输入法框架）。
 
-四个变量都可以用 `systemd.services.kasmvnc-session.environment.<NAME>` 覆盖。
+`NIX_PROFILES`、`XDG_DATA_DIRS`、`XDG_CONFIG_DIRS` 等不再由模块声明，全部来自
+`/etc/profile`；如果确实需要覆盖，用
+`systemd.services.kasmvnc-session.environment.<NAME>`（比如想强制一个与登录会话不同的
+`NIX_PROFILES`）。
 
 使用方法是**系统层启用输入法框架**，模块不需要额外配置：
 
@@ -234,7 +298,8 @@ X 服务器与桌面会话是**两个单元**：
 需要注意的点：
 
 - **`GTK_PATH` 不需要注入。** `environment.profileRelativeSessionVariables` 里的
-  `GTK_PATH` 只影响登录 shell，GTK 靠 `NIX_PROFILES` 已经能定位缓存。
+  `GTK_PATH` 只影响登录 shell，GTK 靠 `NIX_PROFILES` 已经能定位缓存（不过 wrapper
+  source `/etc/profile` 后会一并带上它，与登录会话一致）。
 - **`waylandFrontend = true` 会让登录会话反而缺三件套。** `i18n.inputMethod` 在该选项下
   只设置 `XMODIFIERS`（Wayland 下不需要 `GTK_IM_MODULE`/`QT_IM_MODULE`），但 X11 会话
   （本模块）仍然依赖它们。模块会因此在会话里补上 fcitx5 的默认值；如果希望会话环境与
@@ -245,20 +310,20 @@ X 服务器与桌面会话是**两个单元**：
 
 ## 实现要点
 
-- **会话 `PATH` 包含用户 profile，launcher 才能列出 home-manager 安装的应用。** 模块为
-  两个单元的 `path` 在系统 profile（`/run/current-system/sw`）之后追加
-  `/etc/profiles/per-user/<user>` 与 `~/.nix-profile`（systemd 会为每一项加上 `/bin`、
-  `/sbin`），与登录会话的 `PATH` 语义一致。这不只是「命令能找到」的问题：GLib 的
-  `GDesktopAppInfo` 在加载 `.desktop` 文件时会用 `g_find_program_for_path()` 在进程
-  `PATH` 里校验 `Exec[0]`（以及 `TryExec`），找不到就构造失败并返回 NULL，于是该应用从
-  所有 launcher（panel、whisker menu、appfinder）里**静默消失**——这正是 home-manager
-  安装的、`Exec=` 写裸命令名的应用（如 `zen-beta`、`btm`、`zeditor`）在 kasmvnc 会话里
-  不显示、而 `Exec=` 为绝对 store 路径的应用（如 `wechat`）能显示的原因。补上用户 profile
-  后它们全部正常出现。
-- **裸命令名靠 `ExecSearchPath`**：systemd 本身**不会**用单元的 `PATH` 解析相对
-  `ExecStart`（`PATH` 只影响它拉起的进程），因此模块用 `ExecSearchPath=` 把同样的目录
-  交给 systemd 查找，`windowManager` 里的裸命令名（如
-  `dbus-run-session xfce4-session`）才能生效。
+- **会话 `PATH` 来自登录环境（并额外前置用户 profile），launcher 才能列出 home-manager
+  安装的应用。** wrapper source `/etc/profile`，`/etc/set-environment` 的 `PATH` 以
+  `/run/wrappers/bin` 开头、并包含 `environment.profiles` 派生的用户 profile
+  （`/etc/profiles/per-user/<user>/bin`、`~/.nix-profile/bin`…）；wrapper 又把这两个用户
+  profile 和模块自己的包装到最前面，所以它们优先于系统 profile。这不只是「命令能找到」
+  的问题：GLib 的 `GDesktopAppInfo` 在加载 `.desktop` 文件时会用
+  `g_find_program_for_path()` 在进程 `PATH` 里校验 `Exec[0]`（以及 `TryExec`），找不到就
+  构造失败并返回 NULL，于是该应用从所有 launcher（panel、whisker menu、appfinder）里
+  **静默消失**——这正是 home-manager 安装的、`Exec=` 写裸命令名的应用（如 `zen-beta`、
+  `btm`、`zeditor`）在 kasmvnc 会话里不显示、而 `Exec=` 为绝对 store 路径的应用（如
+  `wechat`）能显示的原因。
+- **裸命令名由 wrapper 在登录 `PATH` 里解析。** `windowManager` 的单词作为参数交给
+  wrapper，wrapper 用 `command -v` 在登录 `PATH` 中解析第一个词再 `exec` 绝对路径——
+  与登录 shell 的行为一致（因此不需要 `ExecSearchPath=`）。
 - **Xvnc 是一个 X server DDX**（`unix/xserver/hw/vnc`），只能通过给 xorg-server 打
   patch 并一起编译得到，不能简单地链接 nixpkgs 的 `xorgserver`。因此构建时解包
   nixpkgs `xorg-server` 的源码（21.1.24）到 `unix/xserver`，应用上游
@@ -289,6 +354,10 @@ X 服务器与桌面会话是**两个单元**：
 ## 限制与非目标
 
 - 单实例、单 display（模块内部结构可按 display 扩展，但不提供多实例 options）。
+- **logind 会话类型是 `unspecified`，不是真正的「login」。** 系统服务没有 tty/display
+  会话类型，`pam_systemd` 也无从得知；这不影响 `$XDG_RUNTIME_DIR`、user manager 与 user
+  bus（`loginctl` 里会话正常可见），但依赖 seat / session type 的功能（如某些
+  `loginctl lock-session` 集成、音频的 seat 策略）不会被激活。
 - 不打包 kasmweb 容器编排平台；不复刻镜像里的 icewm / 字体栈，会话内容由使用者通过
   `windowManager` 提供。输入法不由本模块安装（用 `i18n.inputMethod`），模块只保证会话
   环境能让程序找到**并且真的启用**已装好的 immodule（见上面的「输入法」）。
@@ -311,7 +380,12 @@ VM 测试：
 - `checks.<sys>.kasmvnc`：声明口令 + icewm 的完整场景（含 TLS、BasicAuth、重启）
 - `checks.<sys>.kasmvnc-no-password`：仅 `enable = true` 的默认场景（无会话单元）
 - `checks.<sys>.kasmvnc-path-wm`：只在系统 profile 中的裸命令名 WM 能否被会话单元拉起
-- `checks.<sys>.kasmvnc-xfce`：XDG 会话环境注入（xfconfd、failsafe 会话、面板）
+  （解析走登录 `PATH`）
+- `checks.<sys>.kasmvnc-login-parity`：登录语义本体——logind 会话、`/run/user/<uid>/bus`、
+  `DBUS_SESSION_BUS_ADDRESS`/`XDG_RUNTIME_DIR`，以及会话 environ 的
+  `NIX_PROFILES`/`XDG_*`/`GTK_PATH`/`LOCALE_ARCHIVE`/`LANG` 与 `su -` 逐字相等；还断言
+  session `PATH` = wrapper 前置项 + 登录 `PATH`
+- `checks.<sys>.kasmvnc-xfce`：XDG 会话环境（xfconfd、failsafe 会话、面板）
 - `checks.<sys>.kasmvnc-launcher`：会话 `PATH` 含用户 profile（用 PyGObject 调
   `Gio.DesktopAppInfo` 验证 GLib 能加载 `Exec=` 为裸命令名、程序只在用户 profile 里的
   `.desktop` 文件）
@@ -320,4 +394,5 @@ VM 测试：
   `gtk-im-context-simple`，并断言会话 environ 里有 `GTK_IM_MODULE` / `QT_IM_MODULE`；
   两个节点覆盖「继承系统变量」与 `waylandFrontend = true` 时的「模块补默认值」）
 - `checks.<sys>.kasmvnc-session-restart`：会话生命周期（注销 / 崩溃后自动重启、`systemctl
-  restart kasmvnc` 级联、`systemctl stop kasmvnc` 全部退出且不复活）
+  restart kasmvnc` 级联、`systemctl stop kasmvnc` 全部退出且不复活；同时断言 PAM 会话在
+  每次重启后是新的一条、停止后关闭）
